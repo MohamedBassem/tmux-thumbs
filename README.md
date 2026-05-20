@@ -1,3 +1,5 @@
+> This is a slop fork of the original tmux-thumbs project that's maintained by LLMs and heavily customized for my own needs. You're better off using the original project.
+
 # tmux-thumbs
 
 [![Build Status](https://github.com/fcsonline/tmux-thumbs/workflows/Rust/badge.svg)](https://github.com/fcsonline/tmux-thumbs/actions)
