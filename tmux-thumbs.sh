@@ -37,6 +37,10 @@ function get-opt-arg() {
 
 PARAMS=(--dir "${CURRENT_DIR}")
 
+if [ -n "${1:-}" ]; then
+  PARAMS+=(--pane "${1}")
+fi
+
 function add-param() {
   local type opt arg
   opt="${1}"; type="${2}"

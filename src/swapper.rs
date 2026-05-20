@@ -62,13 +62,18 @@ pub struct Swapper<'a> {
   upcase_command: String,
   multi_command: String,
   osc52: bool,
+  target_pane_id: Option<String>,
   active_pane_id: Option<String>,
+  active_pane_width: Option<i32>,
   active_pane_height: Option<i32>,
   active_pane_scroll_position: Option<i32>,
   active_pane_zoomed: Option<bool>,
   thumbs_pane_id: Option<String>,
+  thumbs_window_id: Option<String>,
   content: Option<String>,
   signal: String,
+  ready_signal: String,
+  start_signal: String,
 }
 
 impl<'a> Swapper<'a> {
@@ -79,11 +84,15 @@ impl<'a> Swapper<'a> {
     upcase_command: String,
     multi_command: String,
     osc52: bool,
-  ) -> Swapper {
+    target_pane_id: Option<String>,
+  ) -> Swapper<'a> {
     let since_the_epoch = SystemTime::now()
       .duration_since(UNIX_EPOCH)
       .expect("Time went backwards");
-    let signal = format!("thumbs-finished-{}", since_the_epoch.as_secs());
+    let suffix = since_the_epoch.as_nanos();
+    let signal = format!("thumbs-finished-{}", suffix);
+    let ready_signal = format!("thumbs-ready-{}", suffix);
+    let start_signal = format!("thumbs-start-{}", suffix);
 
     Swapper {
       executor,
@@ -92,22 +101,46 @@ impl<'a> Swapper<'a> {
       upcase_command,
       multi_command,
       osc52,
+      target_pane_id,
       active_pane_id: None,
+      active_pane_width: None,
       active_pane_height: None,
       active_pane_scroll_position: None,
       active_pane_zoomed: None,
       thumbs_pane_id: None,
+      thumbs_window_id: None,
       content: None,
       signal,
+      ready_signal,
+      start_signal,
     }
   }
 
   pub fn capture_active_pane(&mut self) {
+    if let Some(target_pane_id) = self.target_pane_id.clone() {
+      let active_command = vec![
+        "tmux",
+        "display-message",
+        "-t",
+        target_pane_id.as_str(),
+        "-p",
+        "#{pane_id}:#{?pane_in_mode,1,0}:#{pane_height}:#{scroll_position}:#{window_zoomed_flag}:#{window_height}:#{pane_width}:#{window_width}",
+      ];
+
+      let output = self
+        .executor
+        .execute(active_command.iter().map(|arg| arg.to_string()).collect());
+      let chunks: Vec<&str> = output.split(':').collect();
+
+      self.store_active_pane(chunks);
+      return;
+    }
+
     let active_command = vec![
       "tmux",
       "list-panes",
       "-F",
-      "#{pane_id}:#{?pane_in_mode,1,0}:#{pane_height}:#{scroll_position}:#{window_zoomed_flag}:#{?pane_active,active,nope}",
+      "#{pane_id}:#{?pane_in_mode,1,0}:#{pane_height}:#{scroll_position}:#{window_zoomed_flag}:#{window_height}:#{pane_width}:#{window_width}:#{?pane_active,active,nope}",
     ];
 
     let output = self
@@ -119,20 +152,33 @@ impl<'a> Swapper<'a> {
 
     let active_pane = chunks
       .iter()
-      .find(|&chunks| *chunks.get(5).unwrap() == "active")
+      .find(|&chunks| *chunks.get(8).unwrap() == "active")
       .expect("Unable to find active pane");
 
+    self.store_active_pane(active_pane.to_vec());
+  }
+
+  fn store_active_pane(&mut self, active_pane: Vec<&str>) {
     let pane_id = active_pane.get(0).unwrap();
 
     self.active_pane_id = Some(pane_id.to_string());
 
+    let zoomed_pane = *active_pane.get(4).expect("Unable to retrieve zoom pane property") == "1";
+    let height_index = if zoomed_pane { 5 } else { 2 };
+    let width_index = if zoomed_pane { 7 } else { 6 };
     let pane_height = active_pane
-      .get(2)
+      .get(height_index)
       .unwrap()
       .parse()
       .expect("Unable to retrieve pane height");
+    let pane_width = active_pane
+      .get(width_index)
+      .unwrap()
+      .parse()
+      .expect("Unable to retrieve pane width");
 
     self.active_pane_height = Some(pane_height);
+    self.active_pane_width = Some(pane_width);
 
     if active_pane.get(1).unwrap().to_string() == "1" {
       let pane_scroll_position = active_pane
@@ -143,8 +189,6 @@ impl<'a> Swapper<'a> {
 
       self.active_pane_scroll_position = Some(pane_scroll_position);
     }
-
-    let zoomed_pane = *active_pane.get(4).expect("Unable to retrieve zoom pane property") == "1";
 
     self.active_pane_zoomed = Some(zoomed_pane);
   }
@@ -215,12 +259,14 @@ impl<'a> Swapper<'a> {
     };
 
     let pane_command = format!(
-        "tmux capture-pane -J -t {active_pane_id} -p{scroll_params} | tail -n {height} | {dir}/target/release/thumbs -f '%U:%H' -t {tmp} {args}; tmux swap-pane -t {active_pane_id}; {zoom_command} tmux wait-for -S {signal}",
+        "tmux wait-for {start_signal}; rm -f {tmp}; tmux capture-pane -J -t {active_pane_id} -p{scroll_params} | tail -n {height} | {dir}/target/release/thumbs -f '%U:%H' -t {tmp} --ready-signal {ready_signal} {args}; tmux wait-for -S {ready_signal}; tmux swap-pane -t {active_pane_id}; {zoom_command} tmux wait-for -S {signal}",
         active_pane_id = active_pane_id,
         scroll_params = scroll_params,
         height = self.active_pane_height.unwrap_or(i32::MAX),
         dir = self.dir,
         tmp = TMP_FILE,
+        start_signal = self.start_signal,
+        ready_signal = self.ready_signal,
         args = args.join(" "),
         zoom_command = zoom_command,
         signal = self.signal
@@ -231,7 +277,7 @@ impl<'a> Swapper<'a> {
       "new-window",
       "-P",
       "-F",
-      "#{pane_id}",
+      "#{pane_id}:#{window_id}",
       "-d",
       "-n",
       "[thumbs]",
@@ -240,7 +286,46 @@ impl<'a> Swapper<'a> {
 
     let params: Vec<String> = thumbs_command.iter().map(|arg| arg.to_string()).collect();
 
-    self.thumbs_pane_id = Some(self.executor.execute(params));
+    let output = self.executor.execute(params);
+    let chunks: Vec<&str> = output.split(':').collect();
+
+    self.thumbs_pane_id = Some(chunks.get(0).expect("Unable to retrieve thumbs pane id").to_string());
+    self.thumbs_window_id = Some(chunks.get(1).expect("Unable to retrieve thumbs window id").to_string());
+  }
+
+  pub fn resize_window(&mut self) {
+    let thumbs_window_id = self.thumbs_window_id.as_mut().unwrap().clone();
+    let active_pane_width = self.active_pane_width.unwrap();
+    let active_pane_height = self.active_pane_height.unwrap();
+
+    self.executor.execute(vec![
+      "tmux".to_string(),
+      "resize-window".to_string(),
+      "-t".to_string(),
+      thumbs_window_id,
+      "-x".to_string(),
+      active_pane_width.to_string(),
+      "-y".to_string(),
+      active_pane_height.to_string(),
+    ]);
+  }
+
+  pub fn start_thumbs(&mut self) {
+    let wait_command = vec!["tmux", "wait-for", "-S", self.start_signal.as_str()];
+    let params = wait_command.iter().map(|arg| arg.to_string()).collect();
+
+    self.executor.execute(params);
+  }
+
+  pub fn wait_ready(&mut self) {
+    let wait_command = vec!["tmux", "wait-for", self.ready_signal.as_str()];
+    let params = wait_command.iter().map(|arg| arg.to_string()).collect();
+
+    self.executor.execute(params);
+  }
+
+  pub fn is_active_pane_zoomed(&self) -> bool {
+    self.active_pane_zoomed.unwrap_or(false)
   }
 
   pub fn swap_panes(&mut self) {
@@ -255,6 +340,7 @@ impl<'a> Swapper<'a> {
       active_pane_id.as_str(),
       "-t",
       thumbs_pane_id.as_str(),
+      if self.is_active_pane_zoomed() { "-Z" } else { "" },
     ];
 
     let params = swap_command
@@ -442,7 +528,8 @@ mod tests {
 
   #[test]
   fn retrieve_active_pane() {
-    let last_command_outputs = vec!["%97:100:24:1:0:active\n%106:100:24:1:0:nope\n%107:100:24:1:0:nope\n".to_string()];
+    let last_command_outputs =
+      vec!["%97:100:24:1:0:24:80:80:active\n%106:100:24:1:0:24:80:80:nope\n%107:100:24:1:0:24:80:80:nope\n".to_string()];
     let mut executor = TestShell::new(last_command_outputs);
     let mut swapper = Swapper::new(
       Box::new(&mut executor),
@@ -451,6 +538,7 @@ mod tests {
       "".to_string(),
       "".to_string(),
       false,
+      None,
     );
 
     swapper.capture_active_pane();
@@ -459,12 +547,44 @@ mod tests {
   }
 
   #[test]
+  fn retrieve_target_pane() {
+    let last_command_outputs = vec!["%98:0:10:0:1:24:40:80".to_string()];
+    let mut executor = TestShell::new(last_command_outputs);
+    let mut swapper = Swapper::new(
+      Box::new(&mut executor),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+      Some("%98".to_string()),
+    );
+
+    swapper.capture_active_pane();
+
+    let expectation = vec![
+      "tmux",
+      "display-message",
+      "-t",
+      "%98",
+      "-p",
+      "#{pane_id}:#{?pane_in_mode,1,0}:#{pane_height}:#{scroll_position}:#{window_zoomed_flag}:#{window_height}:#{pane_width}:#{window_width}",
+    ];
+
+    assert_eq!(swapper.active_pane_id.unwrap(), "%98");
+    assert_eq!(swapper.active_pane_height.unwrap(), 24);
+    assert_eq!(swapper.active_pane_width.unwrap(), 80);
+    assert_eq!(swapper.active_pane_zoomed.unwrap(), true);
+    assert_eq!(executor.last_executed().unwrap(), expectation);
+  }
+
+  #[test]
   fn swap_panes() {
     let last_command_outputs = vec![
       "".to_string(),
-      "%100".to_string(),
+      "%100:@1".to_string(),
       "".to_string(),
-      "%106:100:24:1:0:nope\n%98:100:24:1:0:active\n%107:100:24:1:0:nope\n".to_string(),
+      "%106:100:24:1:0:24:80:80:nope\n%98:100:24:1:0:24:80:80:active\n%107:100:24:1:0:24:80:80:nope\n".to_string(),
     ];
     let mut executor = TestShell::new(last_command_outputs);
     let mut swapper = Swapper::new(
@@ -474,6 +594,7 @@ mod tests {
       "".to_string(),
       "".to_string(),
       false,
+      None,
     );
 
     swapper.capture_active_pane();
@@ -500,6 +621,7 @@ mod tests {
       upcase_command,
       multi_command,
       false,
+      None,
     );
 
     swapper.content = Some(format!(
@@ -557,6 +679,12 @@ fn app_args<'a>() -> clap::ArgMatches<'a> {
         .default_value("tmux set-buffer -- \"{}\" && tmux paste-buffer && tmux display-message \"Multi copied {}\""),
     )
     .arg(
+      Arg::with_name("pane")
+        .help("Pane id to capture")
+        .long("pane")
+        .takes_value(true),
+    )
+    .arg(
       Arg::with_name("osc52")
         .help("Print OSC52 copy escape sequence in addition to running the pick command")
         .long("osc52")
@@ -571,6 +699,7 @@ fn main() -> std::io::Result<()> {
   let command = args.value_of("command").unwrap();
   let upcase_command = args.value_of("upcase_command").unwrap();
   let multi_command = args.value_of("multi_command").unwrap();
+  let pane = args.value_of("pane");
   let osc52 = args.is_present("osc52");
 
   if dir.is_empty() {
@@ -585,12 +714,23 @@ fn main() -> std::io::Result<()> {
     upcase_command.to_string(),
     multi_command.to_string(),
     osc52,
+    pane.map(|value| value.to_string()),
   );
 
   swapper.capture_active_pane();
   swapper.execute_thumbs();
-  swapper.swap_panes();
-  swapper.resize_pane();
+  swapper.resize_window();
+
+  if swapper.is_active_pane_zoomed() {
+    swapper.swap_panes();
+    swapper.start_thumbs();
+    swapper.wait_ready();
+  } else {
+    swapper.start_thumbs();
+    swapper.wait_ready();
+    swapper.swap_panes();
+  }
+
   swapper.wait_thumbs();
   swapper.retrieve_content();
   swapper.destroy_content();

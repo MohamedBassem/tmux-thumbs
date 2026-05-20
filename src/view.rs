@@ -1,6 +1,8 @@
 use super::*;
 use std::char;
+use std::fmt::Write as FmtWrite;
 use std::io::{stdout, Read, Write};
+use std::process::Command;
 use termion::async_stdin;
 use termion::event::Key;
 use termion::input::TermRead;
@@ -25,6 +27,8 @@ pub struct View<'a> {
   background_color: Box<dyn color::Color>,
   hint_background_color: Box<dyn color::Color>,
   hint_foreground_color: Box<dyn color::Color>,
+  ready_signal: Option<&'a str>,
+  ready_sent: bool,
   chosen: Vec<(String, bool)>,
 }
 
@@ -49,9 +53,10 @@ impl<'a> View<'a> {
     background_color: Box<dyn color::Color>,
     hint_foreground_color: Box<dyn color::Color>,
     hint_background_color: Box<dyn color::Color>,
+    ready_signal: Option<&'a str>,
   ) -> View<'a> {
     let matches = state.matches(reverse, unique);
-    let skip = if reverse { matches.len() - 1 } else { 0 };
+    let skip = if reverse && !matches.is_empty() { matches.len() - 1 } else { 0 };
 
     View {
       state,
@@ -68,6 +73,8 @@ impl<'a> View<'a> {
       background_color,
       hint_foreground_color,
       hint_background_color,
+      ready_signal,
+      ready_sent: false,
       chosen: vec![],
     }
   }
@@ -93,13 +100,15 @@ impl<'a> View<'a> {
   }
 
   fn render(&self, stdout: &mut dyn Write, typed_hint: &str) -> () {
-    write!(stdout, "{}", cursor::Hide).unwrap();
+    let mut frame = String::new();
+
+    write!(&mut frame, "{}", cursor::Hide).unwrap();
 
     for (index, line) in self.state.lines.iter().enumerate() {
       let clean = line.trim_end_matches(|c: char| c.is_whitespace());
 
       if !clean.is_empty() {
-        print!("{goto}{text}", goto = cursor::Goto(1, index as u16 + 1), text = line);
+        write!(&mut frame, "{goto}{text}", goto = cursor::Goto(1, index as u16 + 1), text = line).unwrap();
       }
     }
 
@@ -130,7 +139,8 @@ impl<'a> View<'a> {
       let offset = (mat.x as u16) - (extra as u16);
       let text = self.make_hint_text(mat.text);
 
-      print!(
+      write!(
+        &mut frame,
         "{goto}{background}{foregroud}{text}{resetf}{resetb}",
         goto = cursor::Goto(offset + 1, mat.y as u16 + 1),
         foregroud = color::Fg(&**selected_color),
@@ -138,7 +148,8 @@ impl<'a> View<'a> {
         resetf = color::Fg(color::Reset),
         resetb = color::Bg(color::Reset),
         text = &text
-      );
+      )
+      .unwrap();
 
       if let Some(ref hint) = mat.hint {
         let extra_position = match self.position {
@@ -151,7 +162,8 @@ impl<'a> View<'a> {
         let text = self.make_hint_text(hint.as_str());
         let final_position = std::cmp::max(offset as i16 + extra_position as i16, 0);
 
-        print!(
+        write!(
+          &mut frame,
           "{goto}{background}{foregroud}{text}{resetf}{resetb}",
           goto = cursor::Goto(final_position as u16 + 1, mat.y as u16 + 1),
           foregroud = color::Fg(&*self.hint_foreground_color),
@@ -159,10 +171,12 @@ impl<'a> View<'a> {
           resetf = color::Fg(color::Reset),
           resetb = color::Bg(color::Reset),
           text = &text
-        );
+        )
+        .unwrap();
 
         if hint.starts_with(typed_hint) {
-          print!(
+          write!(
+            &mut frame,
             "{goto}{background}{foregroud}{text}{resetf}{resetb}",
             goto = cursor::Goto(final_position as u16 + 1, mat.y as u16 + 1),
             foregroud = color::Fg(&*self.multi_foreground_color),
@@ -170,16 +184,36 @@ impl<'a> View<'a> {
             resetf = color::Fg(color::Reset),
             resetb = color::Bg(color::Reset),
             text = &typed_hint
-          );
+          )
+          .unwrap();
         }
       }
     }
 
+    stdout.write_all(frame.as_bytes()).unwrap();
     stdout.flush().unwrap();
+  }
+
+  fn signal_ready(&mut self) {
+    if self.ready_sent {
+      return;
+    }
+
+    self.ready_sent = true;
+
+    if let Some(signal) = self.ready_signal {
+      Command::new("tmux")
+        .arg("wait-for")
+        .arg("-S")
+        .arg(signal)
+        .output()
+        .expect("Unable to signal ready state");
+    }
   }
 
   fn listen(&mut self, stdin: &mut dyn Read, stdout: &mut dyn Write) -> CaptureEvent {
     if self.matches.is_empty() {
+      self.signal_ready();
       return CaptureEvent::Exit;
     }
 
@@ -193,6 +227,7 @@ impl<'a> View<'a> {
       .clone();
 
     self.render(stdout, &typed_hint);
+    self.signal_ready();
 
     loop {
       match stdin.keys().next() {
@@ -336,6 +371,8 @@ mod tests {
       background_color: colors::get_color("default"),
       hint_background_color: colors::get_color("default"),
       hint_foreground_color: colors::get_color("default"),
+      ready_signal: None,
+      ready_sent: false,
       chosen: vec![],
     };
 
