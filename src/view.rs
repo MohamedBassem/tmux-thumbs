@@ -31,6 +31,7 @@ pub struct View<'a> {
   hint_foreground_color: Box<dyn color::Color>,
   ready_signal: Option<&'a str>,
   ready_sent: bool,
+  pane_width: Option<usize>,
   chosen: Vec<(String, bool)>,
 }
 
@@ -68,6 +69,7 @@ impl<'a> View<'a> {
     hint_foreground_color: Box<dyn color::Color>,
     hint_background_color: Box<dyn color::Color>,
     ready_signal: Option<&'a str>,
+    pane_width: Option<usize>,
   ) -> View<'a> {
     let matches = state.matches(reverse, unique);
     let skip = if reverse && !matches.is_empty() { matches.len() - 1 } else { 0 };
@@ -89,6 +91,7 @@ impl<'a> View<'a> {
       hint_background_color,
       ready_signal,
       ready_sent: false,
+      pane_width,
       chosen: vec![],
     }
   }
@@ -115,14 +118,23 @@ impl<'a> View<'a> {
 
   fn render(&self, stdout: &mut dyn Write, typed_hint: &str) -> () {
     let mut frame = String::new();
+    let line_offsets = self.line_offsets();
 
     write!(&mut frame, "{}{}{}", cursor::Hide, cursor::Goto(1, 1), clear::All).unwrap();
 
     for (index, line) in self.state.lines.iter().enumerate() {
-      let clean = line.trim_end_matches(|c: char| c.is_whitespace());
+      for (row, text) in self.display_rows(line).iter().enumerate() {
+        let clean = text.trim_end_matches(|c: char| c.is_whitespace());
 
-      if !clean.is_empty() {
-        write!(&mut frame, "{goto}{text}", goto = cursor::Goto(1, index as u16 + 1), text = line).unwrap();
+        if !clean.is_empty() {
+          write!(
+            &mut frame,
+            "{goto}{text}",
+            goto = cursor::Goto(1, (line_offsets[index] + row) as u16 + 1),
+            text = text
+          )
+          .unwrap();
+        }
       }
     }
 
@@ -148,15 +160,14 @@ impl<'a> View<'a> {
 
       // Find long utf sequences and extract it from mat.x
       let line = &self.state.lines[mat.y as usize];
-      let prefix = &line[0..mat.x as usize];
-      let extra = prefix.width_cjk() - prefix.chars().count();
-      let offset = (mat.x as u16) - (extra as u16);
+      let offset = self.visual_column_at(line, mat.x as usize);
       let text = self.make_hint_text(mat.text);
+      let (match_x, match_y) = self.translate_position(line_offsets[mat.y as usize], offset);
 
       write!(
         &mut frame,
         "{goto}{background}{foregroud}{text}{resetf}{resetb}",
-        goto = cursor::Goto(offset + 1, mat.y as u16 + 1),
+        goto = cursor::Goto(match_x as u16 + 1, match_y as u16 + 1),
         foregroud = color::Fg(&**selected_color),
         background = color::Bg(&**selected_background_color),
         resetf = color::Fg(color::Reset),
@@ -174,12 +185,13 @@ impl<'a> View<'a> {
         };
 
         let text = self.make_hint_text(hint.as_str());
-        let final_position = std::cmp::max(offset as i16 + extra_position as i16, 0);
+        let final_position = std::cmp::max(offset as i16 + extra_position as i16, 0) as usize;
+        let (hint_x, hint_y) = self.translate_position(line_offsets[mat.y as usize], final_position);
 
         write!(
           &mut frame,
           "{goto}{background}{foregroud}{text}{resetf}{resetb}",
-          goto = cursor::Goto(final_position as u16 + 1, mat.y as u16 + 1),
+          goto = cursor::Goto(hint_x as u16 + 1, hint_y as u16 + 1),
           foregroud = color::Fg(&*self.hint_foreground_color),
           background = color::Bg(&*self.hint_background_color),
           resetf = color::Fg(color::Reset),
@@ -192,7 +204,7 @@ impl<'a> View<'a> {
           write!(
             &mut frame,
             "{goto}{background}{foregroud}{text}{resetf}{resetb}",
-            goto = cursor::Goto(final_position as u16 + 1, mat.y as u16 + 1),
+            goto = cursor::Goto(hint_x as u16 + 1, hint_y as u16 + 1),
             foregroud = color::Fg(&*self.multi_foreground_color),
             background = color::Bg(&*self.multi_background_color),
             resetf = color::Fg(color::Reset),
@@ -206,6 +218,77 @@ impl<'a> View<'a> {
 
     stdout.write_all(frame.as_bytes()).unwrap();
     stdout.flush().unwrap();
+  }
+
+  fn display_rows(&self, line: &str) -> Vec<String> {
+    let width = match self.pane_width {
+      Some(width) if width > 0 => width,
+      _ => return vec![line.to_string()],
+    };
+
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut row_width = 0;
+
+    for ch in line.chars() {
+      let ch_width = Self::char_width_at(ch, row_width);
+
+      if row_width > 0 && row_width + ch_width > width {
+        rows.push(row);
+        row = String::new();
+        row_width = 0;
+      }
+
+      row.push(ch);
+      row_width += ch_width;
+    }
+
+    rows.push(row);
+    rows
+  }
+
+  fn line_offsets(&self) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let mut offset = 0;
+
+    for line in self.state.lines.iter() {
+      offsets.push(offset);
+      offset += self.display_rows(line).len();
+    }
+
+    offsets
+  }
+
+  fn translate_position(&self, line_offset: usize, column: usize) -> (usize, usize) {
+    if let Some(width) = self.pane_width {
+      if width > 0 {
+        return (column % width, line_offset + (column / width));
+      }
+    }
+
+    (column, line_offset)
+  }
+
+  fn visual_column_at(&self, line: &str, byte_index: usize) -> usize {
+    let mut column = 0;
+
+    for (index, ch) in line.char_indices() {
+      if index >= byte_index {
+        break;
+      }
+
+      column += Self::char_width_at(ch, column);
+    }
+
+    column
+  }
+
+  fn char_width_at(ch: char, column: usize) -> usize {
+    if ch == '\t' {
+      8 - (column % 8)
+    } else {
+      ch.to_string().width_cjk().max(1)
+    }
   }
 
   fn signal_ready(&mut self) {
@@ -460,6 +543,7 @@ mod tests {
       hint_foreground_color: colors::get_color("default"),
       ready_signal: None,
       ready_sent: false,
+      pane_width: None,
       chosen: vec![],
     };
 

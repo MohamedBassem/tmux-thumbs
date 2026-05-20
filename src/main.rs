@@ -143,6 +143,12 @@ fn app_args<'a>() -> clap::ArgMatches<'a> {
         .takes_value(true),
     )
     .arg(
+      Arg::with_name("pane_width")
+        .help("Width of the pane being rendered")
+        .long("pane-width")
+        .takes_value(true),
+    )
+    .arg(
       Arg::with_name("input_socket")
         .help("Reads input events from a Unix socket instead of stdin")
         .long("input-socket")
@@ -158,6 +164,11 @@ fn main() {
   let position = args.value_of("position").unwrap();
   let target = args.value_of("target");
   let ready_signal = args.value_of("ready_signal");
+  let pane_width = args.value_of("pane_width").map(|value| {
+    value
+      .parse::<usize>()
+      .expect("Invalid pane width")
+  });
   let input_socket = args.value_of("input_socket");
   let multi = args.is_present("multi");
   let reverse = args.is_present("reverse");
@@ -205,6 +216,7 @@ fn main() {
       hint_foreground_color,
       hint_background_color,
       ready_signal,
+      pane_width,
     );
 
     if let Some(input_socket) = input_socket {

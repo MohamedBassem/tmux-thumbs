@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOCKET_NAME="tmux-thumbs-smoke-$$"
 SESSION_NAME="thumbs-smoke"
 TMUX_BIN="${TMUX_BIN:-tmux}"
+GIT_STATUS_REPO=""
 
 tmux_cmd() {
   "${TMUX_BIN}" -L "${SOCKET_NAME}" "$@"
@@ -12,6 +13,9 @@ tmux_cmd() {
 
 cleanup() {
   tmux_cmd kill-server >/dev/null 2>&1 || true
+  if [ -n "${GIT_STATUS_REPO}" ]; then
+    rm -rf "${GIT_STATUS_REPO}"
+  fi
 }
 
 fail() {
@@ -37,7 +41,7 @@ wait_for_window() {
   return 1
 }
 
-run_thumbs_and_exit() {
+run_thumbs() {
   local pane_id="$1"
   local socket_path
   local deadline
@@ -55,7 +59,15 @@ run_thumbs_and_exit() {
   done
 
   [ -n "${socket_path}" ] || fail "thumbs input socket was not created"
+  printf '%s\n' "${socket_path}"
+}
 
+run_thumbs_and_exit() {
+  local pane_id="$1"
+  local _window_id="$2"
+  local socket_path
+
+  socket_path="$(run_thumbs "${pane_id}")"
   "${ROOT_DIR}/target/release/tmux-thumbs" --input-socket "${socket_path}" --send-input esc
   sleep 0.4
 }
@@ -85,6 +97,39 @@ tmux_cmd resize-pane -Z -t "${SMALL_PANE}"
 
 run_thumbs_and_exit "${SMALL_PANE}" "${MAIN_WINDOW}"
 assert_pane_alive "${SMALL_PANE}"
+assert_no_thumbs_windows
+
+GIT_STATUS_REPO="$(mktemp -d "${TMPDIR:-/tmp}/tmux-thumbs-git-status.XXXXXX")"
+mkdir -p "${GIT_STATUS_REPO}/.claude" "${GIT_STATUS_REPO}/tmux"
+git -C "${GIT_STATUS_REPO}" init --quiet
+git -C "${GIT_STATUS_REPO}" config user.email smoke@example.com
+git -C "${GIT_STATUS_REPO}" config user.name Smoke
+printf 'one\n' > "${GIT_STATUS_REPO}/.claude/settings.json"
+printf 'one\n' > "${GIT_STATUS_REPO}/tmux/.tmux.conf"
+git -C "${GIT_STATUS_REPO}" add .claude/settings.json tmux/.tmux.conf
+git -C "${GIT_STATUS_REPO}" commit --quiet -m init
+printf 'two\n' > "${GIT_STATUS_REPO}/.claude/settings.json"
+printf 'two\n' > "${GIT_STATUS_REPO}/tmux/.tmux.conf"
+
+STATUS_PANE="$(tmux_cmd new-window -P -F "#{pane_id}" -n git-status "cd '${GIT_STATUS_REPO}' && git status; sleep 1000")"
+STATUS_WINDOW="$(tmux_cmd display-message -p -t "${STATUS_PANE}" "#{window_id}")"
+tmux_cmd resize-window -t "${STATUS_WINDOW}" -x 70 -y 24
+socket_path="$(run_thumbs "${STATUS_PANE}")"
+screen="$(tmux_cmd capture-pane -p -t "${STATUS_WINDOW}")"
+status_fail() {
+  printf '%s\n' "${screen}" >&2
+  fail "$1"
+}
+
+printf '%s\n' "${screen}" | grep -Fq "modified:   .claude/settings.json" || status_fail "git status settings marker was misplaced"
+printf '%s\n' "${screen}" | grep -Fq "modified:   tmux/.tmux.conf" || status_fail "git status tmux marker was misplaced"
+if printf '%s\n' "${screen}" | grep -Eq "modifi[^:]*\\.claude|modifi[^:]*tmux|settings\\.jsons\\.json|\\.tmux\\.confx\\.conf"; then
+  status_fail "git status overlay corrupted file marker text"
+fi
+
+"${ROOT_DIR}/target/release/tmux-thumbs" --input-socket "${socket_path}" --send-input esc
+sleep 0.4
+assert_pane_alive "${STATUS_PANE}"
 assert_no_thumbs_windows
 
 echo "smoke-tmux: ok"

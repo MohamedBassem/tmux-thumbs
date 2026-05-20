@@ -259,10 +259,11 @@ impl<'a> Swapper<'a> {
       };
 
     let pane_command = format!(
-        "tmux wait-for {start_signal}; rm -f {tmp}; rm -f {input_socket}; tmux capture-pane -J -t {active_pane_id} -p{scroll_params} | tail -n {height} | {dir}/target/release/thumbs -f '%U:%H' -t {tmp} --ready-signal {ready_signal} --input-socket {input_socket} {args}; tmux wait-for -S {ready_signal}; tmux wait-for -S {signal}; tmux wait-for {cleanup_signal}",
+        "tmux wait-for {start_signal}; rm -f {tmp}; rm -f {input_socket}; tmux capture-pane -J -t {active_pane_id} -p{scroll_params} | tail -n {height} | {dir}/target/release/thumbs -f '%U:%H' -t {tmp} --ready-signal {ready_signal} --input-socket {input_socket} --pane-width {width} {args}; tmux wait-for -S {ready_signal}; tmux wait-for -S {signal}; tmux wait-for {cleanup_signal}",
         active_pane_id = active_pane_id,
         scroll_params = scroll_params,
         height = self.active_pane_height.unwrap_or(i32::MAX),
+        width = self.active_pane_width.unwrap_or(i32::MAX),
         dir = self.dir,
         tmp = TMP_FILE,
         input_socket = self.input_socket,
