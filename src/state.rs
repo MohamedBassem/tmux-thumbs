@@ -69,7 +69,7 @@ impl<'a> State<'a> {
     }
   }
 
-  pub fn matches(&self, reverse: bool, unique: bool) -> Vec<Match<'a>> {
+  pub fn matches(&self, reverse: bool, _unique: bool) -> Vec<Match<'a>> {
     let (listing_lines, listing_context_lines) = self.listing_context_indexes();
     let (git_status_lines, git_status_context_lines) = self.git_status_context_indexes();
     let mut matches = self.command_matches(&listing_lines);
@@ -165,8 +165,17 @@ impl<'a> State<'a> {
       }
     }
 
+    self.assign_hints(&mut matches, reverse);
+
+    matches
+  }
+
+  fn assign_hints(&self, matches: &mut Vec<Match<'a>>, reverse: bool) {
     let alphabet = super::alphabets::get_alphabet(self.alphabet);
     let mut hints = alphabet.hints(matches.len());
+    let available_hints = hints.iter().cloned().collect::<HashSet<String>>();
+    let has_multi_character_hints = hints.iter().any(|hint| hint.chars().count() > 1);
+    let reserved_prefixes = Self::reserved_hint_prefixes(&hints);
 
     // This looks wrong but we do a pop after
     if !reverse {
@@ -176,21 +185,33 @@ impl<'a> State<'a> {
       hints.reverse();
     }
 
-    if unique {
-      let mut previous: HashMap<&str, String> = HashMap::new();
+    let mut assigned_by_text: HashMap<&str, String> = HashMap::new();
+    let mut used_hints: HashSet<String> = HashSet::new();
 
-      for mat in &mut matches {
-        if let Some(previous_hint) = previous.get(mat.text) {
-          mat.hint = Some(previous_hint.clone());
-        } else if let Some(hint) = hints.pop() {
-          mat.hint = Some(hint.to_string().clone());
-          previous.insert(mat.text, hint.to_string().clone());
+    for mat in matches.iter_mut() {
+      if let Some(previous_hint) = assigned_by_text.get(mat.text) {
+        mat.hint = Some(previous_hint.clone());
+        continue;
+      }
+
+      if let Some(preferred_hint) = self.preferred_hint_for_match(mat, alphabet.letters()) {
+        if (!has_multi_character_hints || available_hints.contains(&preferred_hint))
+          && !used_hints.contains(&preferred_hint)
+          && !reserved_prefixes.contains(&preferred_hint)
+        {
+          hints.retain(|hint| hint != &preferred_hint);
+          used_hints.insert(preferred_hint.clone());
+          assigned_by_text.insert(mat.text, preferred_hint.clone());
+          mat.hint = Some(preferred_hint);
+          continue;
         }
       }
-    } else {
-      for mat in &mut matches {
-        if let Some(hint) = hints.pop() {
-          mat.hint = Some(hint.to_string().clone());
+
+      while let Some(hint) = hints.pop() {
+        if used_hints.insert(hint.clone()) {
+          assigned_by_text.insert(mat.text, hint.clone());
+          mat.hint = Some(hint);
+          break;
         }
       }
     }
@@ -198,8 +219,6 @@ impl<'a> State<'a> {
     if reverse {
       matches.reverse();
     }
-
-    matches
   }
 
   fn command_matches(&self, listing_lines: &HashSet<usize>) -> Vec<Match<'a>> {
@@ -215,6 +234,31 @@ impl<'a> State<'a> {
     }
 
     matches
+  }
+
+  fn reserved_hint_prefixes(hints: &[String]) -> HashSet<String> {
+    let mut prefixes = HashSet::new();
+
+    for hint in hints {
+      let mut prefix = String::new();
+      for ch in hint.chars().take(hint.chars().count().saturating_sub(1)) {
+        prefix.push(ch);
+        prefixes.insert(prefix.clone());
+      }
+    }
+
+    prefixes
+  }
+
+  fn preferred_hint_for_match(&self, mat: &Match, alphabet: &str) -> Option<String> {
+    let line = self.lines.get(mat.y as usize)?;
+    let ch = line.get(mat.x as usize..)?.chars().next()?;
+    let normalized = ch.to_lowercase().next().unwrap_or(ch);
+
+    alphabet
+      .chars()
+      .find(|letter| letter.to_lowercase().next().unwrap_or(*letter) == normalized)
+      .map(|letter| letter.to_string())
   }
 
   fn listing_context_indexes(&self) -> (HashSet<usize>, HashSet<usize>) {
@@ -526,7 +570,7 @@ mod tests {
 
     assert_eq!(results.len(), 3);
     assert_eq!(results.first().unwrap().hint.clone().unwrap(), "a");
-    assert_eq!(results.last().unwrap().hint.clone().unwrap(), "c");
+    assert_eq!(results.last().unwrap().hint.clone().unwrap(), "a");
   }
 
   #[test]
@@ -538,6 +582,65 @@ mod tests {
     assert_eq!(results.len(), 3);
     assert_eq!(results.first().unwrap().hint.clone().unwrap(), "a");
     assert_eq!(results.last().unwrap().hint.clone().unwrap(), "a");
+  }
+
+  #[test]
+  fn exact_matches_share_hints_without_unique_mode() {
+    let lines = split("lorem 127.0.0.1 lorem 255.255.255.255 lorem 127.0.0.1 lorem");
+    let custom = [].to_vec();
+    let results = State::new(&lines, "abcd", &custom).matches(false, false);
+
+    assert_eq!(results.get(0).unwrap().hint.clone().unwrap(), results.get(2).unwrap().hint.clone().unwrap());
+  }
+
+  #[test]
+  fn preferred_hints_use_match_start_character_with_deterministic_ties() {
+    let lines = split("Cat Car Dog");
+    let custom = [r"[A-Z][a-z]+"].to_vec();
+    let results = State::new(&lines, "abcd", &custom).matches(false, false);
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results.get(0).unwrap().text, "Cat");
+    assert_eq!(results.get(0).unwrap().hint.clone().unwrap(), "c");
+    assert_eq!(results.get(1).unwrap().text, "Car");
+    assert_eq!(results.get(1).unwrap().hint.clone().unwrap(), "a");
+    assert_eq!(results.get(2).unwrap().text, "Dog");
+    assert_eq!(results.get(2).unwrap().hint.clone().unwrap(), "d");
+  }
+
+  #[test]
+  fn preferred_hints_do_not_shadow_multi_character_hints() {
+    let lines = split("Dog Ape Bat Cow Emu Fox");
+    let custom = [r"[A-Z][a-z]+"].to_vec();
+    let results = State::new(&lines, "abcd", &custom).matches(false, false);
+
+    assert_eq!(results.len(), 6);
+    assert_ne!(results.get(0).unwrap().hint.clone().unwrap(), "d");
+    assert!(results.iter().any(|mat| mat.hint.clone().unwrap().starts_with('d')));
+  }
+
+  #[test]
+  fn preferred_hints_do_not_allocate_keys_outside_generated_hints() {
+    let lines = split("Ace Bat Cat Dog Egg Fox");
+    let custom = [r"[A-Z][a-z]+"].to_vec();
+    let results = State::new(&lines, "abcd", &custom).matches(false, false);
+    let hints = results.iter().map(|mat| mat.hint.clone().unwrap()).collect::<Vec<_>>();
+
+    assert_eq!(hints, ["a", "b", "c", "da", "db", "dc"]);
+  }
+
+  #[test]
+  fn git_ls_style_paths_still_get_multi_character_hints() {
+    let lines = split(
+      "src/a.rs src/b.rs src/c.rs src/d.rs src/e.rs src/f.rs src/g.rs src/h.rs src/i.rs src/j.rs src/k.rs src/l.rs src/m.rs src/n.rs src/o.rs src/p.rs src/q.rs src/r.rs src/s.rs src/t.rs src/u.rs src/v.rs src/w.rs src/x.rs src/y.rs src/z.rs src/aa.rs src/ab.rs",
+    );
+    let custom = [].to_vec();
+    let results = State::new(&lines, "qwerty", &custom).matches(false, false);
+    let hints = results.iter().filter_map(|mat| mat.hint.clone()).collect::<Vec<_>>();
+
+    assert_eq!(results.len(), 28);
+    assert_eq!(hints.len(), 28);
+    assert!(hints.iter().any(|hint| hint.chars().count() > 1));
   }
 
   #[test]

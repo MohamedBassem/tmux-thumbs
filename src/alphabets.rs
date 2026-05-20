@@ -30,8 +30,12 @@ pub struct Alphabet<'a> {
 }
 
 impl<'a> Alphabet<'a> {
-  fn new(letters: &'a str) -> Alphabet {
+  fn new(letters: &'a str) -> Alphabet<'a> {
     Alphabet { letters }
+  }
+
+  pub fn letters(&self) -> &'a str {
+    self.letters
   }
 
   pub fn hints(&self, matches: usize) -> Vec<String> {

@@ -87,10 +87,11 @@ run_thumbs_and_exit() {
 run_thumbs_and_select() {
   local pane_id="$1"
   local extra_args="${2:-}"
+  local hint="${3:-a}"
   local socket_path
 
   socket_path="$(run_thumbs "${pane_id}" "${extra_args}")"
-  "${ROOT_DIR}/target/release/tmux-thumbs" --input-socket "${socket_path}" --send-input hint:a
+  "${ROOT_DIR}/target/release/tmux-thumbs" --input-socket "${socket_path}" --send-input "hint:${hint}"
   sleep 0.4
 }
 
@@ -128,7 +129,7 @@ run_thumbs_and_exit "${MAIN_PANE}" "${MAIN_WINDOW}"
 assert_pane_alive "${MAIN_PANE}"
 assert_no_thumbs_windows
 
-run_thumbs_and_select "${MAIN_PANE}"
+run_thumbs_and_select "${MAIN_PANE}" "" "h"
 assert_pane_alive "${MAIN_PANE}"
 assert_no_thumbs_windows
 wait_for_buffer "https://example.com" || fail "selected URL was not copied to tmux buffer"
@@ -195,7 +196,7 @@ if EZA_BIN="$(command -v eza)"; then
     fail "$1"
   }
 
-  printf '%s\n' "${screen}" | grep -Eq " aargo\\.toml" || eza_fail "eza icon marker was misplaced for Cargo.toml"
+  printf '%s\n' "${screen}" | grep -Eq " cargo\\.toml" || eza_fail "eza icon marker was misplaced for Cargo.toml"
   if printf '%s\n' "${screen}" | grep -Eq "^[[:alpha:]] Cargo\\.toml"; then
     eza_fail "eza icon marker overwrote the file icon"
   fi
