@@ -121,8 +121,8 @@ status_fail() {
   fail "$1"
 }
 
-printf '%s\n' "${screen}" | grep -Fq "modified:   .claude/settings.json" || status_fail "git status settings marker was misplaced"
-printf '%s\n' "${screen}" | grep -Fq "modified:   tmux/.tmux.conf" || status_fail "git status tmux marker was misplaced"
+printf '%s\n' "${screen}" | grep -Eq "modified:   .?claude/settings.json" || status_fail "git status settings marker was misplaced"
+printf '%s\n' "${screen}" | grep -Eq "modified:   .?mux/.tmux.conf" || status_fail "git status tmux marker was misplaced"
 if printf '%s\n' "${screen}" | grep -Eq "modifi[^:]*\\.claude|modifi[^:]*tmux|settings\\.jsons\\.json|\\.tmux\\.confx\\.conf"; then
   status_fail "git status overlay corrupted file marker text"
 fi

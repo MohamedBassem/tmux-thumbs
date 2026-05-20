@@ -1,5 +1,5 @@
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 const EXCLUDE_PATTERNS: [(&'static str, &'static str); 1] = [("bash", r"[[:cntrl:]]\[([0-9]{1,2};)?([0-9]{1,2})?m")];
@@ -70,7 +70,8 @@ impl<'a> State<'a> {
   }
 
   pub fn matches(&self, reverse: bool, unique: bool) -> Vec<Match<'a>> {
-    let mut matches = Vec::new();
+    let (listing_lines, listing_context_lines) = self.listing_context_indexes();
+    let mut matches = self.command_matches(&listing_lines);
 
     let exclude_patterns = EXCLUDE_PATTERNS
       .iter()
@@ -92,6 +93,10 @@ impl<'a> State<'a> {
     let all_patterns = [exclude_patterns, custom_patterns, patterns].concat();
 
     for (index, line) in self.lines.iter().enumerate() {
+      if listing_lines.contains(&index) || listing_context_lines.contains(&index) {
+        continue;
+      }
+
       let mut chunk: &str = line;
       let mut offset: i32 = 0;
 
@@ -129,13 +134,17 @@ impl<'a> State<'a> {
             // Never hint or broke bash color sequences, but process it
             if *name != "bash" {
               for (subtext, substart) in captures.iter() {
-                matches.push(Match {
-                  x: offset + matching.start() as i32 + *substart as i32,
-                  y: index as i32,
-                  pattern: name,
-                  text: subtext,
-                  hint: None,
-                });
+                let x = offset + matching.start() as i32 + *substart as i32;
+
+                if !Self::overlaps_existing_match(&matches, index as i32, x, subtext.len() as i32) {
+                  matches.push(Match {
+                    x,
+                    y: index as i32,
+                    pattern: name,
+                    text: subtext,
+                    hint: None,
+                  });
+                }
               }
             }
 
@@ -185,6 +194,178 @@ impl<'a> State<'a> {
     }
 
     matches
+  }
+
+  fn command_matches(&self, listing_lines: &HashSet<usize>) -> Vec<Match<'a>> {
+    let mut matches = Vec::new();
+    let mut indexes = listing_lines.iter().collect::<Vec<_>>();
+
+    indexes.sort();
+
+    for index in indexes {
+      if let Some(line) = self.lines.get(*index) {
+        matches.extend(Self::listing_line_matches(line, *index as i32));
+      }
+    }
+
+    matches
+  }
+
+  fn listing_context_indexes(&self) -> (HashSet<usize>, HashSet<usize>) {
+    let mut indexes = HashSet::new();
+    let mut context = HashSet::new();
+    let mut in_listing = false;
+
+    for (index, line) in self.lines.iter().enumerate() {
+      if Self::is_listing_command(line) {
+        in_listing = true;
+        context.insert(index);
+        continue;
+      }
+
+      if !in_listing {
+        continue;
+      }
+
+      if line.trim().is_empty() {
+        in_listing = false;
+        continue;
+      }
+
+      if Self::looks_like_next_prompt(line) {
+        in_listing = false;
+        context.insert(index);
+        continue;
+      }
+
+      indexes.insert(index);
+    }
+
+    (indexes, context)
+  }
+
+  fn is_listing_command(line: &str) -> bool {
+    let clean = Self::strip_ansi(line);
+    let trimmed = clean.trim();
+
+    if trimmed.starts_with("total ") {
+      return false;
+    }
+
+    Regex::new(r"(^|[^\w.-])(ls|eza)(\s|$)")
+      .unwrap()
+      .is_match(trimmed)
+  }
+
+  fn looks_like_next_prompt(line: &str) -> bool {
+    let clean = Self::strip_ansi(line);
+    let trimmed = clean.trim();
+
+    Self::is_listing_command(trimmed) || trimmed.contains('❯') || Regex::new(r"(^|[^\w.-])(git|cd|cat|echo|vim|nvim|less|tail|grep|rg|cargo|npm|pnpm|yarn)(\s|$)")
+      .unwrap()
+      .is_match(trimmed)
+  }
+
+  fn listing_line_matches(line: &'a str, y: i32) -> Vec<Match<'a>> {
+    if line.trim_start().starts_with("total ") {
+      return vec![];
+    }
+
+    if let Some(mat) = Self::long_listing_match(line, y) {
+      return vec![mat];
+    }
+
+    Self::column_listing_matches(line, y)
+  }
+
+  fn long_listing_match(line: &'a str, y: i32) -> Option<Match<'a>> {
+    let trimmed_start = line.trim_start();
+
+    if !Regex::new(r"^[bcdlps.-][rwxStTs-]{9}").unwrap().is_match(trimmed_start) {
+      return None;
+    }
+
+    let tokens = Regex::new(r"\S+").unwrap().find_iter(line).collect::<Vec<_>>();
+
+    if tokens.len() < 6 {
+      return None;
+    }
+
+    let name_token_index = if tokens.len() >= 9 { 8 } else { tokens.len() - 1 };
+    let name_start = tokens[name_token_index].start();
+    let name_end = line[name_start..]
+      .find(" -> ")
+      .map(|offset| name_start + offset)
+      .unwrap_or_else(|| line.trim_end().len());
+
+    if name_end <= name_start {
+      return None;
+    }
+
+    Some(Match {
+      x: name_start as i32,
+      y,
+      pattern: "listing",
+      text: &line[name_start..name_end],
+      hint: None,
+    })
+  }
+
+  fn column_listing_matches(line: &'a str, y: i32) -> Vec<Match<'a>> {
+    let mut matches = Vec::new();
+    let separator = Regex::new(r"\s{2,}|\t+").unwrap();
+    let mut start = 0;
+
+    for separator_match in separator.find_iter(line) {
+      Self::push_listing_column_match(&mut matches, line, y, start, separator_match.start());
+      start = separator_match.end();
+    }
+
+    Self::push_listing_column_match(&mut matches, line, y, start, line.len());
+    matches
+  }
+
+  fn push_listing_column_match(matches: &mut Vec<Match<'a>>, line: &'a str, y: i32, start: usize, end: usize) {
+    let text = &line[start..end];
+    let trimmed = text.trim_matches(|ch: char| ch.is_whitespace());
+
+    if trimmed.is_empty() {
+      return;
+    }
+
+    let entry_start = start + text.find(trimmed).unwrap_or(0);
+    let entry = Self::trim_listing_indicator(trimmed);
+
+    if entry.is_empty() {
+      return;
+    }
+
+    matches.push(Match {
+      x: entry_start as i32,
+      y,
+      pattern: "listing",
+      text: entry,
+      hint: None,
+    });
+  }
+
+  fn trim_listing_indicator(text: &'a str) -> &'a str {
+    text.trim_end_matches(|ch| ch == '*' || ch == '/' || ch == '@' || ch == '=' || ch == '|')
+  }
+
+  fn strip_ansi(line: &str) -> String {
+    Regex::new(r"\x1b\[[0-9;]*m").unwrap().replace_all(line, "").to_string()
+  }
+
+  fn overlaps_existing_match(matches: &[Match], y: i32, x: i32, len: i32) -> bool {
+    matches.iter().any(|mat| {
+      let mat_start = mat.x;
+      let mat_end = mat.x + mat.text.len() as i32;
+      let start = x;
+      let end = x + len;
+
+      mat.y == y && start < mat_end && mat_start < end
+    })
   }
 }
 
@@ -253,6 +434,53 @@ mod tests {
     assert_eq!(results.get(0).unwrap().text.clone(), "/tmp/foo/bar_lol");
     assert_eq!(results.get(1).unwrap().text.clone(), "/var/log/boot-strap.log");
     assert_eq!(results.get(2).unwrap().text.clone(), "../log/kern.log");
+  }
+
+  #[test]
+  fn match_ls_columns_after_command() {
+    let lines = split("~/repo ❯ ls\nCargo.toml  README.md  src  target\n~/repo ❯ echo done");
+    let custom = [].to_vec();
+    let results = State::new(&lines, "abcd", &custom).matches(false, false);
+
+    assert_eq!(results.len(), 4);
+    assert_eq!(results.get(0).unwrap().text, "Cargo.toml");
+    assert_eq!(results.get(1).unwrap().text, "README.md");
+    assert_eq!(results.get(2).unwrap().text, "src");
+    assert_eq!(results.get(3).unwrap().text, "target");
+  }
+
+  #[test]
+  fn match_ls_long_after_command() {
+    let lines = split("~/repo ❯ ls -la\ntotal 16\ndrwxr-xr-x  12 me  staff   384 May 20 10:00 .git\n-rw-r--r--   1 me  staff  1024 May 20 10:00 README.md\nlrwxr-xr-x   1 me  staff     3 May 20 10:00 link -> src");
+    let custom = [].to_vec();
+    let results = State::new(&lines, "abcd", &custom).matches(false, false);
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results.get(0).unwrap().text, ".git");
+    assert_eq!(results.get(1).unwrap().text, "README.md");
+    assert_eq!(results.get(2).unwrap().text, "link");
+  }
+
+  #[test]
+  fn match_eza_output_after_command() {
+    let lines = split("~/repo ❯ eza\nCargo.toml  README.md  src\n~/repo ❯ eza -la\n.rw-r--r-- 1.0k me 20 May 10:00 Cargo.toml");
+    let custom = [].to_vec();
+    let results = State::new(&lines, "abcd", &custom).matches(false, false);
+
+    assert_eq!(results.len(), 4);
+    assert_eq!(results.get(0).unwrap().text, "Cargo.toml");
+    assert_eq!(results.get(1).unwrap().text, "README.md");
+    assert_eq!(results.get(2).unwrap().text, "src");
+    assert_eq!(results.get(3).unwrap().text, "Cargo.toml");
+  }
+
+  #[test]
+  fn does_not_match_bare_words_outside_listing_output() {
+    let lines = split("Cargo.toml README.md src target");
+    let custom = [].to_vec();
+    let results = State::new(&lines, "abcd", &custom).matches(false, false);
+
+    assert_eq!(results.len(), 0);
   }
 
   #[test]
