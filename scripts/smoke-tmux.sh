@@ -6,6 +6,7 @@ SOCKET_NAME="tmux-thumbs-smoke-$$"
 SESSION_NAME="thumbs-smoke"
 TMUX_BIN="${TMUX_BIN:-tmux}"
 GIT_STATUS_REPO=""
+EZA_REPO=""
 
 tmux_cmd() {
   "${TMUX_BIN}" -L "${SOCKET_NAME}" "$@"
@@ -15,6 +16,9 @@ cleanup() {
   tmux_cmd kill-server >/dev/null 2>&1 || true
   if [ -n "${GIT_STATUS_REPO}" ]; then
     rm -rf "${GIT_STATUS_REPO}"
+  fi
+  if [ -n "${EZA_REPO}" ]; then
+    rm -rf "${EZA_REPO}"
   fi
 }
 
@@ -44,22 +48,29 @@ wait_for_window() {
 run_thumbs() {
   local pane_id="$1"
   local extra_args="${2:-}"
-  local socket_path
+  local before_sockets
+  local candidate
+  local socket_path=""
   local deadline
 
+  before_sockets="$(tmux_cmd list-keys -T thumbs 2>/dev/null | sed -n "s/.*--input-socket '\([^']*\)'.*/\1/p" || true)"
   tmux_cmd run-shell -b "${ROOT_DIR}/target/release/tmux-thumbs --dir '${ROOT_DIR}' --pane '${pane_id}' ${extra_args}"
   wait_for_window "[thumbs]" || fail "thumbs window was not created"
 
   deadline=$((SECONDS + 5))
   while [ "${SECONDS}" -lt "${deadline}" ]; do
-    socket_path="$(tmux_cmd list-keys -T thumbs 2>/dev/null | sed -n "s/.*--input-socket '\([^']*\)'.*/\1/p" | head -n 1)"
-    if [ -n "${socket_path}" ] && [ -S "${socket_path}" ]; then
-      break
-    fi
+    while IFS= read -r candidate; do
+      if [ -n "${candidate}" ] && ! printf '%s\n' "${before_sockets}" | grep -Fxq "${candidate}" && [ -S "${candidate}" ]; then
+        socket_path="${candidate}"
+        break
+      fi
+    done < <(tmux_cmd list-keys -T thumbs 2>/dev/null | sed -n "s/.*--input-socket '\([^']*\)'.*/\1/p")
+    [ -n "${socket_path}" ] && break
     sleep 0.05
   done
 
   [ -n "${socket_path}" ] || fail "thumbs input socket was not created"
+  sleep 0.2
   printf '%s\n' "${socket_path}"
 }
 
@@ -137,10 +148,14 @@ git -C "${GIT_STATUS_REPO}" config user.email smoke@example.com
 git -C "${GIT_STATUS_REPO}" config user.name Smoke
 printf 'one\n' > "${GIT_STATUS_REPO}/.claude/settings.json"
 printf 'one\n' > "${GIT_STATUS_REPO}/tmux/.tmux.conf"
-git -C "${GIT_STATUS_REPO}" add .claude/settings.json tmux/.tmux.conf
+printf 'one\n' > "${GIT_STATUS_REPO}/README.md"
+printf 'one\n' > "${GIT_STATUS_REPO}/Cargo.toml"
+git -C "${GIT_STATUS_REPO}" add .claude/settings.json tmux/.tmux.conf README.md Cargo.toml
 git -C "${GIT_STATUS_REPO}" commit --quiet -m init
 printf 'two\n' > "${GIT_STATUS_REPO}/.claude/settings.json"
 printf 'two\n' > "${GIT_STATUS_REPO}/tmux/.tmux.conf"
+printf 'two\n' > "${GIT_STATUS_REPO}/README.md"
+printf 'two\n' > "${GIT_STATUS_REPO}/Cargo.toml"
 
 STATUS_PANE="$(tmux_cmd new-window -P -F "#{pane_id}" -n git-status "cd '${GIT_STATUS_REPO}' && git status; sleep 1000")"
 STATUS_WINDOW="$(tmux_cmd display-message -p -t "${STATUS_PANE}" "#{window_id}")"
@@ -154,6 +169,8 @@ status_fail() {
 
 printf '%s\n' "${screen}" | grep -Eq "modified:   .?claude/settings.json" || status_fail "git status settings marker was misplaced"
 printf '%s\n' "${screen}" | grep -Eq "modified:   .?mux/.tmux.conf" || status_fail "git status tmux marker was misplaced"
+printf '%s\n' "${screen}" | grep -Eq "modified:   .?EADME.md" || status_fail "git status README marker was misplaced"
+printf '%s\n' "${screen}" | grep -Eq "modified:   .?argo.toml" || status_fail "git status Cargo marker was misplaced"
 if printf '%s\n' "${screen}" | grep -Eq "modifi[^:]*\\.claude|modifi[^:]*tmux|settings\\.jsons\\.json|\\.tmux\\.confx\\.conf"; then
   status_fail "git status overlay corrupted file marker text"
 fi
@@ -162,5 +179,31 @@ fi
 sleep 0.4
 assert_pane_alive "${STATUS_PANE}"
 assert_no_thumbs_windows
+
+if EZA_BIN="$(command -v eza)"; then
+  EZA_REPO="$(mktemp -d "${TMPDIR:-/tmp}/tmux-thumbs-eza-icons.XXXXXX")"
+  touch "${EZA_REPO}/Cargo.toml" "${EZA_REPO}/README.md"
+  mkdir -p "${EZA_REPO}/src"
+
+  EZA_PANE="$(tmux_cmd new-window -P -F "#{pane_id}" -n eza-icons "cd '${EZA_REPO}' && printf '~/repo ❯ eza --icons\n' && '${EZA_BIN}' --icons=always --color=never --oneline; sleep 1000")"
+  EZA_WINDOW="$(tmux_cmd display-message -p -t "${EZA_PANE}" "#{window_id}")"
+  tmux_cmd resize-window -t "${EZA_WINDOW}" -x 70 -y 24
+  socket_path="$(run_thumbs "${EZA_PANE}")"
+  screen="$(tmux_cmd capture-pane -p -t "${EZA_WINDOW}")"
+  eza_fail() {
+    printf '%s\n' "${screen}" >&2
+    fail "$1"
+  }
+
+  printf '%s\n' "${screen}" | grep -Eq " aargo\\.toml" || eza_fail "eza icon marker was misplaced for Cargo.toml"
+  if printf '%s\n' "${screen}" | grep -Eq "^[[:alpha:]] Cargo\\.toml"; then
+    eza_fail "eza icon marker overwrote the file icon"
+  fi
+
+  "${ROOT_DIR}/target/release/tmux-thumbs" --input-socket "${socket_path}" --send-input esc
+  sleep 0.4
+  assert_pane_alive "${EZA_PANE}"
+  assert_no_thumbs_windows
+fi
 
 echo "smoke-tmux: ok"

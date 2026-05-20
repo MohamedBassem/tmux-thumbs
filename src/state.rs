@@ -71,7 +71,9 @@ impl<'a> State<'a> {
 
   pub fn matches(&self, reverse: bool, unique: bool) -> Vec<Match<'a>> {
     let (listing_lines, listing_context_lines) = self.listing_context_indexes();
+    let (git_status_lines, git_status_context_lines) = self.git_status_context_indexes();
     let mut matches = self.command_matches(&listing_lines);
+    matches.extend(self.git_status_matches(&git_status_lines));
 
     let exclude_patterns = EXCLUDE_PATTERNS
       .iter()
@@ -93,7 +95,11 @@ impl<'a> State<'a> {
     let all_patterns = [exclude_patterns, custom_patterns, patterns].concat();
 
     for (index, line) in self.lines.iter().enumerate() {
-      if listing_lines.contains(&index) || listing_context_lines.contains(&index) {
+      if listing_lines.contains(&index)
+        || listing_context_lines.contains(&index)
+        || git_status_lines.contains(&index)
+        || git_status_context_lines.contains(&index)
+      {
         continue;
       }
 
@@ -244,6 +250,40 @@ impl<'a> State<'a> {
     (indexes, context)
   }
 
+  fn git_status_context_indexes(&self) -> (HashSet<usize>, HashSet<usize>) {
+    let mut indexes = HashSet::new();
+    let mut context = HashSet::new();
+    let mut in_status = false;
+
+    for (index, line) in self.lines.iter().enumerate() {
+      if Self::is_git_status_command(line) {
+        in_status = true;
+        context.insert(index);
+        continue;
+      }
+
+      if !in_status {
+        continue;
+      }
+
+      if line.trim().is_empty() {
+        context.insert(index);
+        continue;
+      }
+
+      if Self::git_status_line_match(line, index as i32).is_some() {
+        indexes.insert(index);
+      } else if !Self::starts_with_whitespace(line) && Self::looks_like_next_prompt(line) {
+        in_status = false;
+        context.insert(index);
+      } else {
+        context.insert(index);
+      }
+    }
+
+    (indexes, context)
+  }
+
   fn is_listing_command(line: &str) -> bool {
     let clean = Self::strip_ansi(line);
     let trimmed = clean.trim();
@@ -253,6 +293,19 @@ impl<'a> State<'a> {
     }
 
     Regex::new(r"(^|[^\w.-])(ls|eza)(\s|$)")
+      .unwrap()
+      .is_match(trimmed)
+  }
+
+  fn is_git_status_command(line: &str) -> bool {
+    let clean = Self::strip_ansi(line);
+    let trimmed = clean.trim();
+
+    if trimmed.contains("git status") {
+      return true;
+    }
+
+    Regex::new(r"(^|[^[:alnum:]_.-])git[[:space:]]+status([[:space:]]|$)")
       .unwrap()
       .is_match(trimmed)
   }
@@ -276,6 +329,68 @@ impl<'a> State<'a> {
     }
 
     Self::column_listing_matches(line, y)
+  }
+
+  fn git_status_matches(&self, git_status_lines: &HashSet<usize>) -> Vec<Match<'a>> {
+    let mut matches = Vec::new();
+    let mut indexes = git_status_lines.iter().collect::<Vec<_>>();
+
+    indexes.sort();
+
+    for index in indexes {
+      if let Some(line) = self.lines.get(*index) {
+        if let Some(mat) = Self::git_status_line_match(line, *index as i32) {
+          matches.push(mat);
+        }
+      }
+    }
+
+    matches
+  }
+
+  fn git_status_line_match(line: &'a str, y: i32) -> Option<Match<'a>> {
+    let trimmed = line.trim();
+
+    if trimmed.is_empty() || trimmed.starts_with('(') {
+      return None;
+    }
+
+    let path = if let Some(colon) = trimmed.find(':') {
+      let status = trimmed[..colon].trim();
+      if !matches!(
+        status,
+        "modified" | "deleted" | "new file" | "renamed" | "copied" | "both modified" | "both added" | "both deleted"
+      ) {
+        return None;
+      }
+
+      trimmed[colon + 1..].trim()
+    } else if Self::starts_with_whitespace(line) {
+      trimmed
+    } else {
+      return None;
+    };
+
+    if path.is_empty() || path.starts_with('(') {
+      return None;
+    }
+
+    let path = if let Some(arrow) = path.rfind(" -> ") {
+      &path[arrow + 4..]
+    } else {
+      path
+    };
+
+    let path = path.trim_matches('"');
+    let start = line.find(path)?;
+
+    Some(Match {
+      x: start as i32,
+      y,
+      pattern: "git_status",
+      text: path,
+      hint: None,
+    })
   }
 
   fn long_listing_match(line: &'a str, y: i32) -> Option<Match<'a>> {
@@ -333,8 +448,9 @@ impl<'a> State<'a> {
       return;
     }
 
-    let entry_start = start + text.find(trimmed).unwrap_or(0);
-    let entry = Self::trim_listing_indicator(trimmed);
+    let trimmed_start = text.find(trimmed).unwrap_or(0);
+    let (icon_offset, entry) = Self::trim_listing_icon(Self::trim_listing_indicator(trimmed));
+    let entry_start = start + trimmed_start + icon_offset;
 
     if entry.is_empty() {
       return;
@@ -353,8 +469,33 @@ impl<'a> State<'a> {
     text.trim_end_matches(|ch| ch == '*' || ch == '/' || ch == '@' || ch == '=' || ch == '|')
   }
 
+  fn trim_listing_icon(text: &'a str) -> (usize, &'a str) {
+    let mut chars = text.char_indices();
+
+    if let Some((_, first)) = chars.next() {
+      if !first.is_ascii_alphanumeric() && first != '.' {
+        if let Some((space_index, ch)) = chars.next() {
+          if ch.is_whitespace() {
+            let entry_start = text[space_index..]
+              .find(|candidate: char| !candidate.is_whitespace())
+              .map(|offset| space_index + offset)
+              .unwrap_or(text.len());
+
+            return (entry_start, &text[entry_start..]);
+          }
+        }
+      }
+    }
+
+    (0, text)
+  }
+
   fn strip_ansi(line: &str) -> String {
     Regex::new(r"\x1b\[[0-9;]*m").unwrap().replace_all(line, "").to_string()
+  }
+
+  fn starts_with_whitespace(line: &str) -> bool {
+    line.chars().next().map(|ch| ch.is_whitespace()).unwrap_or(false)
   }
 
   fn overlaps_existing_match(matches: &[Match], y: i32, x: i32, len: i32) -> bool {
@@ -472,6 +613,33 @@ mod tests {
     assert_eq!(results.get(1).unwrap().text, "README.md");
     assert_eq!(results.get(2).unwrap().text, "src");
     assert_eq!(results.get(3).unwrap().text, "Cargo.toml");
+  }
+
+  #[test]
+  fn match_eza_icons_output_after_command() {
+    let lines = split("~/repo ❯ eza --icons\n\u{e68b} Cargo.toml\n\u{f0ba} README.md\n\u{f31e} src");
+    let custom = [].to_vec();
+    let results = State::new(&lines, "abcd", &custom).matches(false, false);
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results.get(0).unwrap().text, "Cargo.toml");
+    assert_eq!(results.get(0).unwrap().x, 4);
+    assert_eq!(results.get(1).unwrap().text, "README.md");
+    assert_eq!(results.get(1).unwrap().x, 4);
+    assert_eq!(results.get(2).unwrap().text, "src");
+    assert_eq!(results.get(2).unwrap().x, 4);
+  }
+
+  #[test]
+  fn match_git_status_same_directory_files() {
+    let lines = split("~/repo ❯ git status\nOn branch main\nChanges not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n\tmodified:   Cargo.toml\n\tmodified:   README.md\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tsrc.rs\n\nno changes added to commit (use \"git add\" and/or \"git commit -a\")");
+    let custom = [].to_vec();
+    let results = State::new(&lines, "abcd", &custom).matches(false, false);
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results.get(0).unwrap().text, "Cargo.toml");
+    assert_eq!(results.get(1).unwrap().text, "README.md");
+    assert_eq!(results.get(2).unwrap().text, "src.rs");
   }
 
   #[test]

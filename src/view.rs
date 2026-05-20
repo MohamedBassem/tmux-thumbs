@@ -286,9 +286,15 @@ impl<'a> View<'a> {
   fn char_width_at(ch: char, column: usize) -> usize {
     if ch == '\t' {
       8 - (column % 8)
+    } else if Self::is_private_use(ch) {
+      1
     } else {
       ch.to_string().width_cjk().max(1)
     }
+  }
+
+  fn is_private_use(ch: char) -> bool {
+    matches!(ch as u32, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD)
   }
 
   fn signal_ready(&mut self) {
@@ -553,5 +559,11 @@ mod tests {
     view.contrast = true;
     let result = view.make_hint_text("a");
     assert_eq!(result, "[a]".to_string());
+  }
+
+  #[test]
+  fn private_use_icons_use_reported_terminal_width() {
+    assert_eq!(View::char_width_at('\u{e68b}', 0), 1);
+    assert_eq!(View::char_width_at('a', 0), 1);
   }
 }
