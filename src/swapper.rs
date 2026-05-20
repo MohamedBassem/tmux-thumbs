@@ -5,11 +5,12 @@ use clap::crate_version;
 use regex::Regex;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 trait Executor {
   fn execute(&mut self, args: Vec<String>) -> String;
+  fn execute_with_stdin(&mut self, args: Vec<String>, input: &str) -> String;
   fn last_executed(&self) -> Option<Vec<String>>;
 }
 
@@ -29,6 +30,27 @@ impl Executor for RealShell {
       .args(&args[1..])
       .output()
       .expect("Couldn't run it");
+
+    self.executed = Some(args);
+
+    let output: String = String::from_utf8_lossy(&execution.stdout).into();
+
+    output.trim_end().to_string()
+  }
+
+  fn execute_with_stdin(&mut self, args: Vec<String>, input: &str) -> String {
+    let mut child = Command::new(args[0].as_str())
+      .args(&args[1..])
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .spawn()
+      .expect("Couldn't run it");
+
+    if let Some(stdin) = child.stdin.as_mut() {
+      stdin.write_all(input.as_bytes()).expect("Couldn't write to stdin");
+    }
+
+    let execution = child.wait_with_output().expect("Couldn't wait for it");
 
     self.executed = Some(args);
 
@@ -572,16 +594,42 @@ impl<'a> Swapper<'a> {
     }
   }
 
-  pub fn execute_final_command(&mut self, text: &str, execute_command: &str) {
-    let final_command = str::replace(execute_command, "{}", "${THUMB}");
-    let retrieve_command = vec![
-      "bash",
-      "-c",
-      "THUMB=\"$1\"; eval \"$2\"",
-      "--",
+  pub fn copy_text(&mut self, text: &str) {
+    self.executor.execute_with_stdin(
+      vec![
+        "tmux".to_string(),
+        "load-buffer".to_string(),
+        "-w".to_string(),
+        "-".to_string(),
+      ],
       text,
-      final_command.as_str(),
-    ];
+    );
+  }
+
+  pub fn execute_final_command(&mut self, text: &str, execute_command: &str) {
+    let execute_command = if execute_command.contains(":copy:") {
+      self.copy_text(text);
+      if execute_command.trim() == ":copy:" {
+        return;
+      }
+      execute_command.replace(":copy:", "true")
+    } else {
+      execute_command.to_string()
+    };
+
+    let (script, final_command) = if execute_command.contains("{}") {
+      (
+        "THUMB=\"$1\"; eval \"$2\"",
+        str::replace(execute_command.as_str(), "{}", "${THUMB}"),
+      )
+    } else {
+      (
+        "printf %s \"$1\" | eval \"$2\"",
+        execute_command,
+      )
+    };
+
+    let retrieve_command = vec!["bash", "-c", script, "--", text, final_command.as_str()];
 
     let params = retrieve_command.iter().map(|arg| arg.to_string()).collect();
 
@@ -609,6 +657,11 @@ mod tests {
 
   impl Executor for TestShell {
     fn execute(&mut self, args: Vec<String>) -> String {
+      self.executed = Some(args);
+      self.outputs.pop().unwrap()
+    }
+
+    fn execute_with_stdin(&mut self, args: Vec<String>, _input: &str) -> String {
       self.executed = Some(args);
       self.outputs.pop().unwrap()
     }
@@ -740,6 +793,61 @@ mod tests {
 
     assert_eq!(executor.last_executed().unwrap(), expectation);
   }
+
+  #[test]
+  fn stdin_execution() {
+    let last_command_outputs = vec!["".to_string()];
+    let mut executor = TestShell::new(last_command_outputs);
+    let mut swapper = Swapper::new(
+      Box::new(&mut executor),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+      None,
+    );
+
+    swapper.execute_final_command("foobar;rm *", "tmux load-buffer -");
+
+    let expectation = vec![
+      "bash",
+      "-c",
+      "printf %s \"$1\" | eval \"$2\"",
+      "--",
+      "foobar;rm *",
+      "tmux load-buffer -",
+    ];
+
+    assert_eq!(executor.last_executed().unwrap(), expectation);
+  }
+
+  #[test]
+  fn copy_action_uses_tmux_buffer_without_system_clipboard() {
+    let last_command_outputs = vec!["".to_string()];
+    let mut executor = TestShell::new(last_command_outputs);
+    let mut swapper = Swapper::new(
+      Box::new(&mut executor),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+      None,
+    );
+
+    swapper.execute_final_command("https://example.com", ":copy:");
+
+    let expectation = vec![
+      "tmux",
+      "load-buffer",
+      "-w",
+      "-",
+    ];
+
+    assert_eq!(executor.last_executed().unwrap(), expectation);
+  }
+
 }
 
 fn app_args<'a>() -> clap::ArgMatches<'a> {
@@ -756,19 +864,19 @@ fn app_args<'a>() -> clap::ArgMatches<'a> {
       Arg::with_name("command")
         .help("Command to execute after choose a hint")
         .long("command")
-        .default_value("tmux set-buffer -- \"{}\" && tmux display-message \"Copied {}\""),
+        .default_value(":copy:"),
     )
     .arg(
       Arg::with_name("upcase_command")
         .help("Command to execute after choose a hint, in upcase")
         .long("upcase-command")
-        .default_value("tmux set-buffer -- \"{}\" && tmux paste-buffer && tmux display-message \"Copied {}\""),
+        .default_value(":copy: && tmux paste-buffer"),
     )
     .arg(
       Arg::with_name("multi_command")
         .help("Command to execute after choose multiple hints")
         .long("multi-command")
-        .default_value("tmux set-buffer -- \"{}\" && tmux paste-buffer && tmux display-message \"Multi copied {}\""),
+        .default_value(":copy: && tmux paste-buffer"),
     )
     .arg(
       Arg::with_name("pane")

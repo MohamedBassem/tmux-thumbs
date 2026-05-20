@@ -43,10 +43,11 @@ wait_for_window() {
 
 run_thumbs() {
   local pane_id="$1"
+  local extra_args="${2:-}"
   local socket_path
   local deadline
 
-  tmux_cmd run-shell -b "${ROOT_DIR}/target/release/tmux-thumbs --dir '${ROOT_DIR}' --pane '${pane_id}'"
+  tmux_cmd run-shell -b "${ROOT_DIR}/target/release/tmux-thumbs --dir '${ROOT_DIR}' --pane '${pane_id}' ${extra_args}"
   wait_for_window "[thumbs]" || fail "thumbs window was not created"
 
   deadline=$((SECONDS + 5))
@@ -72,6 +73,16 @@ run_thumbs_and_exit() {
   sleep 0.4
 }
 
+run_thumbs_and_select() {
+  local pane_id="$1"
+  local extra_args="${2:-}"
+  local socket_path
+
+  socket_path="$(run_thumbs "${pane_id}" "${extra_args}")"
+  "${ROOT_DIR}/target/release/tmux-thumbs" --input-socket "${socket_path}" --send-input hint:a
+  sleep 0.4
+}
+
 assert_pane_alive() {
   local pane_id="$1"
 
@@ -84,6 +95,20 @@ assert_no_thumbs_windows() {
   fi
 }
 
+wait_for_buffer() {
+  local expected="$1"
+  local deadline=$((SECONDS + 5))
+
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    if tmux_cmd show-buffer 2>/dev/null | grep -Fxq "${expected}"; then
+      return 0
+    fi
+    sleep 0.05
+  done
+
+  return 1
+}
+
 tmux_cmd new-session -d -s "${SESSION_NAME}" -x 100 -y 30 "printf 'https://example.com\n'; sleep 1000"
 MAIN_PANE="$(tmux_cmd display-message -p -t "${SESSION_NAME}:0" "#{pane_id}")"
 MAIN_WINDOW="$(tmux_cmd display-message -p -t "${MAIN_PANE}" "#{window_id}")"
@@ -91,6 +116,12 @@ MAIN_WINDOW="$(tmux_cmd display-message -p -t "${MAIN_PANE}" "#{window_id}")"
 run_thumbs_and_exit "${MAIN_PANE}" "${MAIN_WINDOW}"
 assert_pane_alive "${MAIN_PANE}"
 assert_no_thumbs_windows
+
+run_thumbs_and_select "${MAIN_PANE}"
+assert_pane_alive "${MAIN_PANE}"
+assert_no_thumbs_windows
+wait_for_buffer "https://example.com" || fail "selected URL was not copied to tmux buffer"
+tmux_cmd capture-pane -p -t "${MAIN_PANE}" | grep -Fxq "https://example.com" || fail "selection blanked the original pane"
 
 SMALL_PANE="$(tmux_cmd split-window -P -F "#{pane_id}" -v -l 5 -t "${MAIN_PANE}" "printf 'https://zoom.example.com\n'; sleep 1000")"
 tmux_cmd resize-pane -Z -t "${SMALL_PANE}"
