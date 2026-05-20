@@ -1,9 +1,11 @@
 use super::*;
 use std::char;
 use std::fmt::Write as FmtWrite;
-use std::io::{stdout, Read, Write};
+use std::io::{stdout, BufReader, Read, Write};
+use std::os::unix::net::UnixListener;
 use std::process::Command;
 use termion::async_stdin;
+use termion::clear;
 use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
@@ -35,6 +37,18 @@ pub struct View<'a> {
 enum CaptureEvent {
   Exit,
   Hint,
+}
+
+enum InputEvent {
+  Backspace,
+  Down,
+  Enter,
+  Esc,
+  Hint(String),
+  Left,
+  Right,
+  Space,
+  Up,
 }
 
 impl<'a> View<'a> {
@@ -102,7 +116,7 @@ impl<'a> View<'a> {
   fn render(&self, stdout: &mut dyn Write, typed_hint: &str) -> () {
     let mut frame = String::new();
 
-    write!(&mut frame, "{}", cursor::Hide).unwrap();
+    write!(&mut frame, "{}{}{}", cursor::Hide, cursor::Goto(1, 1), clear::All).unwrap();
 
     for (index, line) in self.state.lines.iter().enumerate() {
       let clean = line.trim_end_matches(|c: char| c.is_whitespace());
@@ -211,6 +225,80 @@ impl<'a> View<'a> {
     }
   }
 
+  fn process_event(&mut self, event: InputEvent, typed_hint: &mut String, longest_hint: &str) -> Option<CaptureEvent> {
+    match event {
+      InputEvent::Esc => {
+        if self.multi && !typed_hint.is_empty() {
+          typed_hint.clear();
+        } else {
+          return Some(CaptureEvent::Exit);
+        }
+      }
+      InputEvent::Up | InputEvent::Left => {
+        self.prev();
+      }
+      InputEvent::Down | InputEvent::Right => {
+        self.next();
+      }
+      InputEvent::Backspace => {
+        typed_hint.pop();
+      }
+      InputEvent::Enter => match self.matches.iter().enumerate().find(|&h| h.0 == self.skip) {
+        Some(hm) => {
+          self.chosen.push((hm.1.text.to_string(), false));
+
+          if !self.multi {
+            return Some(CaptureEvent::Hint);
+          }
+        }
+        _ => panic!("Match not found?"),
+      },
+      InputEvent::Space => {
+        if self.multi {
+          return Some(CaptureEvent::Hint);
+        } else {
+          self.multi = true;
+        }
+      }
+      InputEvent::Hint(key) => {
+        let lower_key = key.to_lowercase();
+
+        typed_hint.push_str(lower_key.as_str());
+
+        let selection = self.matches.iter().find(|mat| mat.hint == Some(typed_hint.clone()));
+
+        match selection {
+          Some(mat) => {
+            self.chosen.push((mat.text.to_string(), key != lower_key));
+
+            if self.multi {
+              typed_hint.clear();
+            } else {
+              return Some(CaptureEvent::Hint);
+            }
+          }
+          None => {
+            if !self.multi && typed_hint.len() >= longest_hint.len() {
+              return Some(CaptureEvent::Exit);
+            }
+          }
+        }
+      }
+    }
+
+    None
+  }
+
+  fn longest_hint(&self) -> String {
+    self
+      .matches
+      .iter()
+      .filter_map(|m| m.hint.clone())
+      .max_by(|x, y| x.len().cmp(&y.len()))
+      .unwrap()
+      .clone()
+  }
+
   fn listen(&mut self, stdin: &mut dyn Read, stdout: &mut dyn Write) -> CaptureEvent {
     if self.matches.is_empty() {
       self.signal_ready();
@@ -218,97 +306,51 @@ impl<'a> View<'a> {
     }
 
     let mut typed_hint: String = "".to_owned();
-    let longest_hint = self
-      .matches
-      .iter()
-      .filter_map(|m| m.hint.clone())
-      .max_by(|x, y| x.len().cmp(&y.len()))
-      .unwrap()
-      .clone();
+    let longest_hint = self.longest_hint();
 
     self.render(stdout, &typed_hint);
     self.signal_ready();
 
     loop {
+      let mut handled_event = |event| {
+        match self.process_event(event, &mut typed_hint, &longest_hint) {
+          Some(CaptureEvent::Hint) => Some(CaptureEvent::Hint),
+          Some(CaptureEvent::Exit) => Some(CaptureEvent::Exit),
+          None => None,
+        }
+      };
+
       match stdin.keys().next() {
         Some(key) => {
           match key {
             Ok(key) => {
-              match key {
-                Key::Esc => {
-                  if self.multi && !typed_hint.is_empty() {
-                    typed_hint.clear();
-                  } else {
-                    break;
-                  }
-                }
-                Key::Up => {
-                  self.prev();
-                }
-                Key::Down => {
-                  self.next();
-                }
-                Key::Left => {
-                  self.prev();
-                }
-                Key::Right => {
-                  self.next();
-                }
-                Key::Backspace => {
-                  typed_hint.pop();
-                }
+              let result = match key {
+                Key::Esc => handled_event(InputEvent::Esc),
+                Key::Up => handled_event(InputEvent::Up),
+                Key::Down => handled_event(InputEvent::Down),
+                Key::Left => handled_event(InputEvent::Left),
+                Key::Right => handled_event(InputEvent::Right),
+                Key::Backspace => handled_event(InputEvent::Backspace),
                 Key::Char(ch) => {
-                  match ch {
-                    '\n' => match self.matches.iter().enumerate().find(|&h| h.0 == self.skip) {
-                      Some(hm) => {
-                        self.chosen.push((hm.1.text.to_string(), false));
+                  let event = match ch {
+                    '\n' => InputEvent::Enter,
+                    ' ' => InputEvent::Space,
+                    key => InputEvent::Hint(key.to_string()),
+                  };
 
-                        if !self.multi {
-                          return CaptureEvent::Hint;
-                        }
-                      }
-                      _ => panic!("Match not found?"),
-                    },
-                    ' ' => {
-                      if self.multi {
-                        // Finalize the multi selection
-                        return CaptureEvent::Hint;
-                      } else {
-                        // Enable the multi selection
-                        self.multi = true;
-                      }
-                    }
-                    key => {
-                      let key = key.to_string();
-                      let lower_key = key.to_lowercase();
-
-                      typed_hint.push_str(lower_key.as_str());
-
-                      let selection = self.matches.iter().find(|mat| mat.hint == Some(typed_hint.clone()));
-
-                      match selection {
-                        Some(mat) => {
-                          self.chosen.push((mat.text.to_string(), key != lower_key));
-
-                          if self.multi {
-                            typed_hint.clear();
-                          } else {
-                            return CaptureEvent::Hint;
-                          }
-                        }
-                        None => {
-                          if !self.multi && typed_hint.len() >= longest_hint.len() {
-                            break;
-                          }
-                        }
-                      }
-                    }
-                  }
+                  handled_event(event)
                 }
                 _ => {
                   // Unknown key
+                  None
                 }
-              }
+              };
+
+              match result {
+                Some(CaptureEvent::Hint) => return CaptureEvent::Hint,
+                Some(CaptureEvent::Exit) => break,
+                None => {}
+              };
             }
             Err(err) => panic!("{}", err),
           }
@@ -340,6 +382,51 @@ impl<'a> View<'a> {
     write!(stdout, "{}", cursor::Show).unwrap();
 
     hints
+  }
+
+  pub fn present_socket(&mut self, socket_path: &str) -> Vec<(String, bool)> {
+    if self.matches.is_empty() {
+      self.signal_ready();
+      return vec![];
+    }
+
+    let _ = std::fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path).expect("Unable to bind input socket");
+    let mut stdout = stdout();
+    let mut typed_hint: String = "".to_owned();
+    let longest_hint = self.longest_hint();
+
+    self.render(&mut stdout, &typed_hint);
+    self.signal_ready();
+
+    for stream in listener.incoming() {
+      let stream = stream.expect("Unable to read input socket");
+      let mut reader = BufReader::new(stream);
+      let mut input = String::new();
+
+      std::io::BufRead::read_line(&mut reader, &mut input).expect("Unable to read input");
+
+      let event = match input.trim_end() {
+        "backspace" => InputEvent::Backspace,
+        "down" => InputEvent::Down,
+        "enter" => InputEvent::Enter,
+        "esc" => InputEvent::Esc,
+        "left" => InputEvent::Left,
+        "right" => InputEvent::Right,
+        "space" => InputEvent::Space,
+        "up" => InputEvent::Up,
+        item if item.starts_with("hint:") => InputEvent::Hint(item.trim_start_matches("hint:").to_string()),
+        _ => continue,
+      };
+
+      match self.process_event(event, &mut typed_hint, &longest_hint) {
+        Some(CaptureEvent::Hint) => return self.chosen.clone(),
+        Some(CaptureEvent::Exit) => return vec![],
+        None => self.render(&mut stdout, &typed_hint),
+      }
+    }
+
+    vec![]
   }
 }
 

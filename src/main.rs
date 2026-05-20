@@ -142,6 +142,12 @@ fn app_args<'a>() -> clap::ArgMatches<'a> {
         .long("ready-signal")
         .takes_value(true),
     )
+    .arg(
+      Arg::with_name("input_socket")
+        .help("Reads input events from a Unix socket instead of stdin")
+        .long("input-socket")
+        .takes_value(true),
+    )
     .get_matches()
 }
 
@@ -152,6 +158,7 @@ fn main() {
   let position = args.value_of("position").unwrap();
   let target = args.value_of("target");
   let ready_signal = args.value_of("ready_signal");
+  let input_socket = args.value_of("input_socket");
   let multi = args.is_present("multi");
   let reverse = args.is_present("reverse");
   let unique = args.is_present("unique");
@@ -200,7 +207,11 @@ fn main() {
       ready_signal,
     );
 
-    viewbox.present()
+    if let Some(input_socket) = input_socket {
+      viewbox.present_socket(input_socket)
+    } else {
+      viewbox.present()
+    }
   };
 
   if !selected.is_empty() {

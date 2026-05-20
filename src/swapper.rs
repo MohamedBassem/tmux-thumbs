@@ -4,6 +4,7 @@ use self::clap::{App, Arg};
 use clap::crate_version;
 use regex::Regex;
 use std::io::Write;
+use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -74,6 +75,8 @@ pub struct Swapper<'a> {
   signal: String,
   ready_signal: String,
   start_signal: String,
+  cleanup_signal: String,
+  input_socket: String,
 }
 
 impl<'a> Swapper<'a> {
@@ -93,6 +96,8 @@ impl<'a> Swapper<'a> {
     let signal = format!("thumbs-finished-{}", suffix);
     let ready_signal = format!("thumbs-ready-{}", suffix);
     let start_signal = format!("thumbs-start-{}", suffix);
+    let cleanup_signal = format!("thumbs-cleanup-{}", suffix);
+    let input_socket = format!("/tmp/thumbs-input-{}", suffix);
 
     Swapper {
       executor,
@@ -113,6 +118,8 @@ impl<'a> Swapper<'a> {
       signal,
       ready_signal,
       start_signal,
+      cleanup_signal,
+      input_socket,
     }
   }
 
@@ -251,24 +258,18 @@ impl<'a> Swapper<'a> {
         "".to_string()
       };
 
-    let active_pane_zoomed = self.active_pane_zoomed.as_mut().unwrap().clone();
-    let zoom_command = if active_pane_zoomed {
-      format!("tmux resize-pane -t {} -Z;", active_pane_id)
-    } else {
-      "".to_string()
-    };
-
     let pane_command = format!(
-        "tmux wait-for {start_signal}; rm -f {tmp}; tmux capture-pane -J -t {active_pane_id} -p{scroll_params} | tail -n {height} | {dir}/target/release/thumbs -f '%U:%H' -t {tmp} --ready-signal {ready_signal} {args}; tmux wait-for -S {ready_signal}; tmux swap-pane -t {active_pane_id}; {zoom_command} tmux wait-for -S {signal}",
+        "tmux wait-for {start_signal}; rm -f {tmp}; rm -f {input_socket}; tmux capture-pane -J -t {active_pane_id} -p{scroll_params} | tail -n {height} | {dir}/target/release/thumbs -f '%U:%H' -t {tmp} --ready-signal {ready_signal} --input-socket {input_socket} {args}; tmux wait-for -S {ready_signal}; tmux wait-for -S {signal}; tmux wait-for {cleanup_signal}",
         active_pane_id = active_pane_id,
         scroll_params = scroll_params,
         height = self.active_pane_height.unwrap_or(i32::MAX),
         dir = self.dir,
         tmp = TMP_FILE,
+        input_socket = self.input_socket,
         start_signal = self.start_signal,
         ready_signal = self.ready_signal,
+        cleanup_signal = self.cleanup_signal,
         args = args.join(" "),
-        zoom_command = zoom_command,
         signal = self.signal
     );
 
@@ -317,6 +318,84 @@ impl<'a> Swapper<'a> {
     self.executor.execute(params);
   }
 
+  pub fn setup_key_table(&mut self) {
+    let socket = self.input_socket.clone();
+    let binary = format!("{}/target/release/tmux-thumbs", self.dir);
+    let mut commands: Vec<Vec<String>> = Vec::new();
+
+    for ch in 'a'..='z' {
+      commands.push(vec![
+        "tmux".to_string(),
+        "bind-key".to_string(),
+        "-T".to_string(),
+        "thumbs".to_string(),
+        ch.to_string(),
+        "run-shell".to_string(),
+        "-b".to_string(),
+        format!("{} --input-socket '{}' --send-input 'hint:{}'", binary, socket, ch),
+      ]);
+      commands.push(vec![
+        "tmux".to_string(),
+        "bind-key".to_string(),
+        "-T".to_string(),
+        "thumbs".to_string(),
+        ch.to_uppercase().to_string(),
+        "run-shell".to_string(),
+        "-b".to_string(),
+        format!("{} --input-socket '{}' --send-input 'hint:{}'", binary, socket, ch.to_uppercase()),
+      ]);
+    }
+
+    let bindings = vec![
+      ("Escape", "esc"),
+      ("C-c", "esc"),
+      ("BSpace", "backspace"),
+      ("Enter", "enter"),
+      ("Space", "space"),
+      ("Up", "up"),
+      ("Down", "down"),
+      ("Left", "left"),
+      ("Right", "right"),
+    ];
+
+    for (key, input) in bindings {
+      commands.push(vec![
+        "tmux".to_string(),
+        "bind-key".to_string(),
+        "-T".to_string(),
+        "thumbs".to_string(),
+        key.to_string(),
+        "run-shell".to_string(),
+        "-b".to_string(),
+        format!("{} --input-socket '{}' --send-input '{}'", binary, socket, input),
+      ]);
+    }
+
+    for command in commands {
+      self.executor.execute(command);
+    }
+  }
+
+  pub fn enter_key_table(&mut self) {
+    self.executor.execute(vec![
+      "tmux".to_string(),
+      "set-window-option".to_string(),
+      "key-table".to_string(),
+      "thumbs".to_string(),
+    ]);
+    self.executor
+      .execute(vec!["tmux".to_string(), "switch-client".to_string(), "-T".to_string(), "thumbs".to_string()]);
+  }
+
+  pub fn exit_key_table(&mut self) {
+    self.executor.execute(vec![
+      "tmux".to_string(),
+      "set-window-option".to_string(),
+      "key-table".to_string(),
+      "root".to_string(),
+    ]);
+  }
+
   pub fn wait_ready(&mut self) {
     let wait_command = vec!["tmux", "wait-for", self.ready_signal.as_str()];
     let params = wait_command.iter().map(|arg| arg.to_string()).collect();
@@ -337,9 +416,9 @@ impl<'a> Swapper<'a> {
       "swap-pane",
       "-d",
       "-s",
-      active_pane_id.as_str(),
-      "-t",
       thumbs_pane_id.as_str(),
+      "-t",
+      active_pane_id.as_str(),
       if self.is_active_pane_zoomed() { "-Z" } else { "" },
     ];
 
@@ -377,6 +456,18 @@ impl<'a> Swapper<'a> {
     let params = wait_command.iter().map(|arg| arg.to_string()).collect();
 
     self.executor.execute(params);
+  }
+
+  pub fn kill_thumbs_window(&mut self) {
+    let thumbs_window_id = self.thumbs_window_id.as_mut().unwrap().clone();
+    let kill_command = vec!["tmux", "kill-window", "-t", thumbs_window_id.as_str()];
+    let params = kill_command.iter().map(|arg| arg.to_string()).collect();
+
+    self.executor.execute(params);
+  }
+
+  pub fn cleanup_input_socket(&mut self) {
+    let _ = std::fs::remove_file(self.input_socket.as_str());
   }
 
   pub fn retrieve_content(&mut self) {
@@ -601,7 +692,7 @@ mod tests {
     swapper.execute_thumbs();
     swapper.swap_panes();
 
-    let expectation = vec!["tmux", "swap-pane", "-d", "-s", "%98", "-t", "%100"];
+    let expectation = vec!["tmux", "swap-pane", "-d", "-s", "%100", "-t", "%98"];
 
     assert_eq!(executor.last_executed().unwrap(), expectation);
   }
@@ -690,7 +781,27 @@ fn app_args<'a>() -> clap::ArgMatches<'a> {
         .long("osc52")
         .short("o"),
     )
+    .arg(
+      Arg::with_name("input_socket")
+        .help("Socket used to send input to an active thumbs overlay")
+        .long("input-socket")
+        .takes_value(true),
+    )
+    .arg(
+      Arg::with_name("send_input")
+        .help("Send one input event to an active thumbs overlay")
+        .long("send-input")
+        .takes_value(true),
+    )
     .get_matches()
+}
+
+fn send_input(socket_path: &str, input: &str) -> std::io::Result<()> {
+  let mut socket = UnixStream::connect(socket_path)?;
+
+  socket.write_all(input.as_bytes())?;
+  socket.write_all(b"\n")?;
+  socket.flush()
 }
 
 fn main() -> std::io::Result<()> {
@@ -701,6 +812,14 @@ fn main() -> std::io::Result<()> {
   let multi_command = args.value_of("multi_command").unwrap();
   let pane = args.value_of("pane");
   let osc52 = args.is_present("osc52");
+
+  if let Some(input) = args.value_of("send_input") {
+    let socket_path = args
+      .value_of("input_socket")
+      .expect("--send-input requires --input-socket");
+
+    return send_input(socket_path, input);
+  }
 
   if dir.is_empty() {
     panic!("Invalid tmux-thumbs execution. Are you trying to execute tmux-thumbs directly?")
@@ -719,19 +838,26 @@ fn main() -> std::io::Result<()> {
 
   swapper.capture_active_pane();
   swapper.execute_thumbs();
+  swapper.setup_key_table();
   swapper.resize_window();
 
   if swapper.is_active_pane_zoomed() {
     swapper.swap_panes();
     swapper.start_thumbs();
     swapper.wait_ready();
+    swapper.enter_key_table();
   } else {
     swapper.start_thumbs();
     swapper.wait_ready();
     swapper.swap_panes();
+    swapper.enter_key_table();
   }
 
   swapper.wait_thumbs();
+  swapper.exit_key_table();
+  swapper.swap_panes();
+  swapper.kill_thumbs_window();
+  swapper.cleanup_input_socket();
   swapper.retrieve_content();
   swapper.destroy_content();
   swapper.execute_command();
