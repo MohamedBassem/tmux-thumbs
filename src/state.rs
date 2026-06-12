@@ -2,6 +2,18 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+lazy_static! {
+  static ref LISTING_COMMAND_RE: Regex = Regex::new(r"(^|[^\w.-])(ls|eza)(\s|$)").unwrap();
+  static ref GIT_STATUS_COMMAND_RE: Regex =
+    Regex::new(r"(^|[^[:alnum:]_.-])git[[:space:]]+status([[:space:]]|$)").unwrap();
+  static ref NEXT_PROMPT_RE: Regex =
+    Regex::new(r"(^|[^\w.-])(git|cd|cat|echo|vim|nvim|less|tail|grep|rg|cargo|npm|pnpm|yarn)(\s|$)").unwrap();
+  static ref LONG_LISTING_PERMS_RE: Regex = Regex::new(r"^[bcdlps.-][rwxStTs-]{9}").unwrap();
+  static ref NON_WHITESPACE_RE: Regex = Regex::new(r"\S+").unwrap();
+  static ref LISTING_SEPARATOR_RE: Regex = Regex::new(r"\s{2,}|\t+").unwrap();
+  static ref ANSI_RE: Regex = Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+}
+
 const EXCLUDE_PATTERNS: [(&'static str, &'static str); 1] = [("bash", r"[[:cntrl:]]\[([0-9]{1,2};)?([0-9]{1,2})?m")];
 
 const PATTERNS: [(&'static str, &'static str); 15] = [
@@ -336,9 +348,7 @@ impl<'a> State<'a> {
       return false;
     }
 
-    Regex::new(r"(^|[^\w.-])(ls|eza)(\s|$)")
-      .unwrap()
-      .is_match(trimmed)
+    LISTING_COMMAND_RE.is_match(trimmed)
   }
 
   fn is_git_status_command(line: &str) -> bool {
@@ -349,18 +359,14 @@ impl<'a> State<'a> {
       return true;
     }
 
-    Regex::new(r"(^|[^[:alnum:]_.-])git[[:space:]]+status([[:space:]]|$)")
-      .unwrap()
-      .is_match(trimmed)
+    GIT_STATUS_COMMAND_RE.is_match(trimmed)
   }
 
   fn looks_like_next_prompt(line: &str) -> bool {
     let clean = Self::strip_ansi(line);
     let trimmed = clean.trim();
 
-    Self::is_listing_command(trimmed) || trimmed.contains('❯') || Regex::new(r"(^|[^\w.-])(git|cd|cat|echo|vim|nvim|less|tail|grep|rg|cargo|npm|pnpm|yarn)(\s|$)")
-      .unwrap()
-      .is_match(trimmed)
+    Self::is_listing_command(trimmed) || trimmed.contains('❯') || NEXT_PROMPT_RE.is_match(trimmed)
   }
 
   fn listing_line_matches(line: &'a str, y: i32) -> Vec<Match<'a>> {
@@ -440,11 +446,11 @@ impl<'a> State<'a> {
   fn long_listing_match(line: &'a str, y: i32) -> Option<Match<'a>> {
     let trimmed_start = line.trim_start();
 
-    if !Regex::new(r"^[bcdlps.-][rwxStTs-]{9}").unwrap().is_match(trimmed_start) {
+    if !LONG_LISTING_PERMS_RE.is_match(trimmed_start) {
       return None;
     }
 
-    let tokens = Regex::new(r"\S+").unwrap().find_iter(line).collect::<Vec<_>>();
+    let tokens = NON_WHITESPACE_RE.find_iter(line).collect::<Vec<_>>();
 
     if tokens.len() < 6 {
       return None;
@@ -472,10 +478,9 @@ impl<'a> State<'a> {
 
   fn column_listing_matches(line: &'a str, y: i32) -> Vec<Match<'a>> {
     let mut matches = Vec::new();
-    let separator = Regex::new(r"\s{2,}|\t+").unwrap();
     let mut start = 0;
 
-    for separator_match in separator.find_iter(line) {
+    for separator_match in LISTING_SEPARATOR_RE.find_iter(line) {
       Self::push_listing_column_match(&mut matches, line, y, start, separator_match.start());
       start = separator_match.end();
     }
@@ -535,7 +540,7 @@ impl<'a> State<'a> {
   }
 
   fn strip_ansi(line: &str) -> String {
-    Regex::new(r"\x1b\[[0-9;]*m").unwrap().replace_all(line, "").to_string()
+    ANSI_RE.replace_all(line, "").to_string()
   }
 
   fn starts_with_whitespace(line: &str) -> bool {
@@ -560,6 +565,74 @@ mod tests {
 
   fn split(output: &str) -> Vec<&str> {
     output.split("\n").collect::<Vec<&str>>()
+  }
+
+  fn bench_corpus() -> String {
+    // A representative terminal capture: prompts, ls output, git status,
+    // diffs, urls, paths, shas, ips and plain prose.
+    let block = "\
+user@host ~/projects/tmux-thumbs ❯ ls
+Cargo.toml  Cargo.lock  README.md  LICENSE  src  samples  scripts  target
+user@host ~/projects/tmux-thumbs ❯ ls -la src
+total 104
+-rw-r--r-- 1 me staff  2985 Jun 12 07:25 alphabets.rs
+-rw-r--r-- 1 me staff  1708 Jun 12 07:25 colors.rs
+-rw-r--r-- 1 me staff  7320 Jun 12 07:25 main.rs
+-rw-r--r-- 1 me staff 32463 Jun 12 07:25 state.rs
+lrwxr-xr-x 1 me staff     3 Jun 12 07:25 link -> ../target
+user@host ~/projects/tmux-thumbs ❯ git status
+On branch master
+Changes not staged for commit:
+  (use \"git add <file>...\" to update what will be committed)
+	modified:   src/state.rs
+	modified:   src/view.rs
+	renamed:    old.txt -> new.txt
+Untracked files:
+	src/bench.rs
+user@host ~/projects/tmux-thumbs ❯ cat notes.txt
+Visit https://github.com/fcsonline/tmux-thumbs for docs and ssh://git@host/repo.
+The server 192.168.1.42 responded, see /var/log/nginx/access.log for details.
+Commit fd70b5695a8c4e1f9d3b2a1c0e7f6d5c4b3a2918 fixed the 0xdeadbeef issue.
+sha256:30557a29d5abc51e5f1d5b472e79b7e296f595abcf19fe6b9199dbbc809c6ff4 layer cached
+The color #ff8800 and uuid 123e4567-e89b-12d3-a456-426655440000 appear in [link](https://example.com/path).
+user@host ~/projects/tmux-thumbs ❯ git diff
+diff --git a/src/state.rs b/src/state.rs
+--- a/src/state.rs
++++ b/src/state.rs
+Just some plain prose line without much to match here at all really.
+";
+    block.repeat(40)
+  }
+
+  #[test]
+  #[ignore]
+  fn bench_matches() {
+    use std::time::Instant;
+
+    let corpus = bench_corpus();
+    let lines = corpus.split('\n').collect::<Vec<&str>>();
+    let custom = ["CUSTOM-[0-9]{4,}", "ISSUE-[0-9]{3}"].to_vec();
+
+    // Warm up.
+    let warm = State::new(&lines, "qwerty", &custom).matches(false, false);
+    let match_count = warm.len();
+
+    let iterations = 50;
+    let start = Instant::now();
+    for _ in 0..iterations {
+      let state = State::new(&lines, "qwerty", &custom);
+      let results = state.matches(false, false);
+      assert_eq!(results.len(), match_count);
+    }
+    let elapsed = start.elapsed();
+
+    eprintln!(
+      "bench_matches: {} lines, {} matches, {} iters, {:.3} ms/iter",
+      lines.len(),
+      match_count,
+      iterations,
+      elapsed.as_secs_f64() * 1000.0 / iterations as f64
+    );
   }
 
   #[test]
