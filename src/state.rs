@@ -120,6 +120,10 @@ impl<'a> State<'a> {
 
       let mut chunk: &str = line;
       let mut offset: i32 = 0;
+      // Generic matches for this line are appended contiguously, and listing
+      // and git-status lines are skipped above, so only matches added from
+      // here on can share this line. Overlap checks need only scan that slice.
+      let line_start = matches.len();
 
       loop {
         // For this line we search the first match of each pattern, then keep
@@ -152,7 +156,7 @@ impl<'a> State<'a> {
               for (subtext, substart) in captures.iter() {
                 let x = offset + matching.start() as i32 + *substart as i32;
 
-                if !Self::overlaps_existing_match(&matches, index as i32, x, subtext.len() as i32) {
+                if !Self::overlaps_existing_match(&matches[line_start..], index as i32, x, subtext.len() as i32) {
                   matches.push(Match {
                     x,
                     y: index as i32,
