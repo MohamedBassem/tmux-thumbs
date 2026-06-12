@@ -537,8 +537,14 @@ impl<'a> State<'a> {
     (0, text)
   }
 
-  fn strip_ansi(line: &str) -> String {
-    ANSI_RE.replace_all(line, "").to_string()
+  fn strip_ansi(line: &str) -> std::borrow::Cow<str> {
+    // Most terminal lines carry no escape sequences; skip the regex pass and
+    // the allocation entirely in that (very common) case.
+    if line.as_bytes().contains(&0x1b) {
+      ANSI_RE.replace_all(line, "")
+    } else {
+      std::borrow::Cow::Borrowed(line)
+    }
   }
 
   fn starts_with_whitespace(line: &str) -> bool {
