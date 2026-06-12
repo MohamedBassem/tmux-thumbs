@@ -3,6 +3,14 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 lazy_static! {
+  static ref EXCLUDE_REGEXES: Vec<(&'static str, Regex)> = EXCLUDE_PATTERNS
+    .iter()
+    .map(|tuple| (tuple.0, Regex::new(tuple.1).unwrap()))
+    .collect();
+  static ref PATTERN_REGEXES: Vec<(&'static str, Regex)> = PATTERNS
+    .iter()
+    .map(|tuple| (tuple.0, Regex::new(tuple.1).unwrap()))
+    .collect();
   static ref LISTING_COMMAND_RE: Regex = Regex::new(r"(^|[^\w.-])(ls|eza)(\s|$)").unwrap();
   static ref GIT_STATUS_COMMAND_RE: Regex =
     Regex::new(r"(^|[^[:alnum:]_.-])git[[:space:]]+status([[:space:]]|$)").unwrap();
@@ -87,24 +95,19 @@ impl<'a> State<'a> {
     let mut matches = self.command_matches(&listing_lines);
     matches.extend(self.git_status_matches(&git_status_lines));
 
-    let exclude_patterns = EXCLUDE_PATTERNS
-      .iter()
-      .map(|tuple| (tuple.0, Regex::new(tuple.1).unwrap()))
-      .collect::<Vec<_>>();
-
     let custom_patterns = self
       .regexp
       .iter()
       .map(|regexp| ("custom", Regex::new(regexp).expect("Invalid custom regexp")))
       .collect::<Vec<_>>();
 
-    let patterns = PATTERNS
-      .iter()
-      .map(|tuple| (tuple.0, Regex::new(tuple.1).unwrap()))
-      .collect::<Vec<_>>();
-
     // This order determines the priority of pattern matching
-    let all_patterns = [exclude_patterns, custom_patterns, patterns].concat();
+    let all_patterns = EXCLUDE_REGEXES
+      .iter()
+      .map(|(name, regex)| (*name, regex))
+      .chain(custom_patterns.iter().map(|(name, regex)| (*name, regex)))
+      .chain(PATTERN_REGEXES.iter().map(|(name, regex)| (*name, regex)))
+      .collect::<Vec<(&str, &Regex)>>();
 
     for (index, line) in self.lines.iter().enumerate() {
       if listing_lines.contains(&index)
@@ -119,20 +122,15 @@ impl<'a> State<'a> {
       let mut offset: i32 = 0;
 
       loop {
-        // For this line we search which patterns match, all of them.
-        let submatches = all_patterns
+        // For this line we search the first match of each pattern, then keep
+        // the one with the lowest start index.
+        let first_match_option = all_patterns
           .iter()
-          .filter_map(|tuple| match tuple.1.find_iter(chunk).nth(0) {
-            Some(m) => Some((tuple.0, tuple.1.clone(), m)),
-            None => None,
-          })
-          .collect::<Vec<_>>();
-
-        // Then, we search for the match with the lowest index
-        let first_match_option = submatches.iter().min_by(|x, y| x.2.start().cmp(&y.2.start()));
+          .filter_map(|(name, regex)| regex.find(chunk).map(|matching| (*name, *regex, matching)))
+          .min_by_key(|(_, _, matching)| matching.start());
 
         if let Some(first_match) = first_match_option {
-          let (name, pattern, matching) = first_match;
+          let (name, pattern, matching) = &first_match;
           let text = matching.as_str();
 
           if let Some(captures) = pattern.captures(text) {
